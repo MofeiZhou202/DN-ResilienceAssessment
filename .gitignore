@@ -1,0 +1,27 @@
+# Byte-compiled / interpreter caches
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+.env/
+
+# Local configuration
+*.log
+*.tmp
+~$*
+
+# Model checkpoints and generated artifacts
+checkpoints/
+output/
+data/
+dataset/
+
+# Temporary uploads
+temp/api_uploads/
+
+# Large raw dataset files (too big for GitHub)
+dataset/raw/SST.mat
