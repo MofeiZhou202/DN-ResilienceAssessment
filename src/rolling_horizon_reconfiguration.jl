@@ -2,8 +2,9 @@ using DataFrames
 using JSON
 using XLSX
 using Logging
+using Dates
 
-include(joinpath(@__DIR__, "juliapowercase2jpc_tp.jl"))
+# 注意：utils 文件已在 workflows.jl 中统一加载，这里不再重复加载
 include(joinpath(@__DIR__, "three_stage_tp_model.jl"))
 
 const DEFAULT_CASE_FILE = joinpath(@__DIR__, "..", "data", "ac_dc_real_case.xlsx")
@@ -29,6 +30,33 @@ const STAGE_NAMES = Dict(
 
 function stage_label(stage::Int)
     return get(STAGE_NAMES, stage, "阶段未知")
+end
+
+"""
+    load_case(filepath::String)
+
+使用新的数据加载流程：先通过 ETAPImporter 加载 Excel 数据，然后转换为 JPC_tp 格式。
+
+参数:
+- `filepath::String`: Excel 文件路径
+
+返回:
+- JPC_tp 结构体，包含转换后的电力系统数据
+"""
+function load_case(filepath::String)
+    println("正在加载电网数据: $filepath")
+    
+    # 第一步：使用 ETAPImporter 加载 Excel 数据到 JuliaPowerCase 结构体
+    julia_case = load_julia_power_data(filepath)
+    
+    # 第二步：将 JuliaPowerCase 转换为 JPC_tp 格式
+    jpc_tp, C_sparse = JuliaPowerCase2Jpc_tp(julia_case)
+    
+    # 将稀疏矩阵添加到 jpc_tp 中（兼容原有逻辑）
+    jpc_tp["Cft"] = C_sparse
+    
+    println("电网数据加载完成")
+    return jpc_tp
 end
 
 function baseline_topology_result(jpc)

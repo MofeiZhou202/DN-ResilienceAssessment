@@ -3,8 +3,16 @@ module Workflows
 using DataFrames
 using XLSX
 using PyCall
+using Dates
 
 const ROOT_DIR = normpath(joinpath(@__DIR__, ".."))
+
+# 首先加载所有工具文件（只加载一次，避免重复定义）
+include(joinpath(@__DIR__, "utils", "idx.jl"))
+include(joinpath(@__DIR__, "utils", "ComponentStructs.jl"))
+include(joinpath(@__DIR__, "utils", "Types.jl"))
+include(joinpath(@__DIR__, "utils", "ETAPImporter.jl"))
+include(joinpath(@__DIR__, "utils", "juliapowercase2jpc_tp.jl"))
 
 include(joinpath(@__DIR__, "classify_scenario_phases.jl"))
 include(joinpath(@__DIR__, "rolling_horizon_reconfiguration.jl"))

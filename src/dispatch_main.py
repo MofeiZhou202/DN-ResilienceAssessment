@@ -316,20 +316,35 @@ def load_hybrid_case(case_path: Path, mess_configs: Sequence[MESSConfig]) -> Hyb
         if bus_label not in name_to_index:
             continue
         mg_nodes.append(name_to_index[bus_label])
-        Pmgmax_list.append(float(getattr(row, "PVAPower", 0.0)))
+        Pmgmax_list.append(float(getattr(row, "PVAPower", 0.0)) * 1000.0)  # MW -> kW
     Cmg = _build_connection_matrix(mg_nodes, nb)
 
     load_nodes: List[int] = []
     Pd_list: List[float] = []
     Qd_list: List[float] = []
+    DEFAULT_PF = 0.9  # 默认功率因数
     for row in load_df.itertuples(index=False):
         bus_label = _normalize_label(getattr(row, "Bus", ""))
         if bus_label not in name_to_index:
             continue
         load_nodes.append(name_to_index[bus_label])
-        demand = float(getattr(row, "MVA", 0.0))
-        Pd_list.append(demand)
-        Qd_list.append(demand / 5.0)
+        # MVA 列实际是 kVA 单位，MTLoadPercent 也是 kVA
+        # 优先使用 MTLoadPercent（如果有值），否则使用 MVA
+        mva_val = float(getattr(row, "MVA", 0.0))  # 实际是 kVA
+        mt_load = float(getattr(row, "MTLoadPercent", 0.0))  # 实际是 kVA
+        pf_val = float(getattr(row, "PF", 0.0)) / 100.0 if hasattr(row, "PF") else 0.0
+        
+        # 如果 MVA 和 PF 都有值，使用 S * PF 计算有功
+        if mva_val > 0 and pf_val > 0:
+            demand_kw = mva_val * pf_val  # kVA * PF = kW
+        elif mt_load > 0:
+            # 使用 MTLoadPercent 作为 kVA，乘以默认功率因数
+            demand_kw = mt_load * DEFAULT_PF
+        else:
+            demand_kw = 0.0
+        
+        Pd_list.append(demand_kw)
+        Qd_list.append(demand_kw * np.tan(np.arccos(DEFAULT_PF)) if demand_kw > 0 else 0.0)
     for row in dcload_df.itertuples(index=False):
         bus_label = _normalize_label(getattr(row, "Bus", ""))
         if bus_label not in name_to_index:
@@ -337,7 +352,7 @@ def load_hybrid_case(case_path: Path, mess_configs: Sequence[MESSConfig]) -> Hyb
         load_nodes.append(name_to_index[bus_label])
         demand_kw = float(getattr(row, "KW", 0.0))
         Pd_list.append(demand_kw)
-        Qd_list.append(demand_kw / 5.0)
+        Qd_list.append(0.0)  # DC负荷无功为0
     Cd = _build_connection_matrix(load_nodes, nb)
 
     Pd = np.asarray(Pd_list, dtype=float)
@@ -1217,6 +1232,21 @@ def optimize_hybrid_dispatch(
 
 def main() -> None:
     case = load_hybrid_case(DEFAULT_CASE_XLSX, DEFAULT_MESS)
+    
+    # 打印负荷统计信息
+    print("="*60)
+    print("配电网数据加载统计")
+    print("="*60)
+    print(f"节点数: AC={case.nb_ac}, DC={case.nb_dc}, 总计={case.nb}")
+    print(f"线路数: AC={case.nl_ac}, DC={case.nl_dc}, VSC={case.nl_vsc}")
+    print(f"负荷数: {len(case.Pd)}")
+    print(f"各负荷功率 (kW): {case.Pd}")
+    print(f"单时刻总负荷功率: {case.Pd.sum():.2f} kW")
+    print(f"总负荷电量 ({DEFAULT_HOURS}小时): {case.Pd.sum() * DEFAULT_HOURS:.2f} kW·h")
+    print(f"微电网/光伏数: {case.nmg}, 最大出力: {case.Pmgmax} kW")
+    print(f"MESS数量: {case.nmess}")
+    print("="*60)
+    
     total_lines = case.nl_ac + case.nl_dc + case.nl_vsc
     statuses, weights, labels = load_topology_status(
         DEFAULT_TOPOLOGY_XLSX, total_lines, DEFAULT_HOURS,

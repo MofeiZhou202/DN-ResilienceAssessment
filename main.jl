@@ -75,30 +75,23 @@ function main()
     end
     
     # 交互式菜单
-    while true
-        show_menu()
-        choice = readline()
-        choice = strip(choice)
-        
-        if choice == "1"
-            run_classify_phases()
-        elseif choice == "2"
-            run_rolling_reconfig()
-        elseif choice == "3"
-            run_mess_dispatch()
-        elseif choice == "4"
-            run_typhoon_workflow()
-        elseif choice == "5"
-            run_full_pipeline()
-        elseif choice == "q" || choice == "Q" || choice == "quit" || choice == "exit"
-            println("\n再见！")
-            break
-        else
-            println("\n无效选项，请重新选择")
-        end
-        
-        println("\n按回车键继续...")
-        readline()
+    show_menu()
+    choice = readline()
+    choice = strip(choice)
+    if choice == "1"
+        run_classify_phases()
+    elseif choice == "2"
+        run_rolling_reconfig()
+    elseif choice == "3"
+        run_mess_dispatch()
+    elseif choice == "4"
+        run_typhoon_workflow()
+    elseif choice == "5"
+        run_full_pipeline()
+    elseif choice == "q" || choice == "Q" || choice == "quit" || choice == "exit"
+        println("\n再见！")
+    else
+        println("\n无效选项，请重新选择")
     end
 end
 

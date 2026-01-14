@@ -233,6 +233,8 @@ function load_case(filepath)
     load_df = DataFrame(XLSX.readtable(filepath, "lumpedload"))
     Pd = []  
     Qd = []  
+    const_load_p = 100.0
+    const_load_q = const_load_p * 0.1
     for row in eachrow(load_df)
         # 验证负荷关联的节点存在性
         if !haskey(name_to_index, row.Bus)
@@ -240,8 +242,8 @@ function load_case(filepath)
         end
 
         # 负荷值
-        push!(Pd, row.MVA)           # 有功功率
-        push!(Qd, row.MVA/5)         # 无功功率
+        push!(Pd, const_load_p)      # 有功功率
+        push!(Qd, const_load_q)      # 无功功率
         
         # 负荷索引
         push!(load_index,
@@ -259,8 +261,8 @@ function load_case(filepath)
         end
 
         # 负荷值
-        push!(Pd_dc, row.KW)           # 有功功率
-        push!(Qd_dc, row.KW/5)         # 无功功率
+        push!(Pd_dc, const_load_p)     # 有功功率，与交流负荷保持一致
+        push!(Qd_dc, const_load_q)     # 无功功率
         
         # 负荷索引
         push!(load_index,

@@ -5,8 +5,10 @@ using LinearAlgebra
 using JuMP
 using Gurobi
 using Printf
+using Dates
 using Base.Filesystem: basename
 
+# 注意：utils 文件已在 workflows.jl 中统一加载，这里不再重复加载
 include(joinpath(@__DIR__, "transportation_network.jl"))
 using .TransportationNetwork: transportation_network, TransportNetworkData
 
@@ -118,10 +120,12 @@ struct HybridGridCase
     Cft_vsc_rows::Vector{Vector{Tuple{Int, Float64}}}
 end
 
+# 默认 MESS 配置 (单位: kW, kWh)
+# 配电网级别：典型移动储能系统容量
 const DEFAULT_MESS = [
-    MESSConfig("MESS-1", 5, 1500.0, 1500.0, 4500.0, 2500.0, 92.0, 90.0),
-    MESSConfig("MESS-2", 10, 1000.0, 1000.0, 4000.0, 2000.0, 92.0, 90.0),
-    MESSConfig("MESS-3", 30, 500.0, 500.0, 3500.0, 1500.0, 92.0, 90.0),
+    MESSConfig("MESS-1", 5, 1500.0, 1500.0, 4500.0, 2500.0, 92.0, 90.0),   # 1500 kW, 4500 kWh
+    MESSConfig("MESS-2", 10, 1000.0, 1000.0, 4000.0, 2000.0, 92.0, 90.0),  # 1000 kW, 4000 kWh
+    MESSConfig("MESS-3", 30, 500.0, 500.0, 3500.0, 1500.0, 92.0, 90.0),    # 500 kW, 3500 kWh
 ]
 
 _normalize_label(value) = strip(string(value))
@@ -297,55 +301,74 @@ function load_hybrid_case(case_path::AbstractString, mess_configs::Vector{MESSCo
         error("未找到电网算例文件 $(case_path)")
     end
 
-    bus_df = DataFrame(XLSX.readtable(case_path, "bus"))
-    dcbus_df = DataFrame(XLSX.readtable(case_path, "dcbus"))
-    line_df = DataFrame(XLSX.readtable(case_path, "cable"))
-    dc_df = DataFrame(XLSX.readtable(case_path, "dcimpedance"))
-    inv_df = DataFrame(XLSX.readtable(case_path, "inverter"))
-    gen_df = DataFrame(XLSX.readtable(case_path, "util"))
-    mg_df = DataFrame(XLSX.readtable(case_path, "pvarray"))
-    load_df_raw = DataFrame(XLSX.readtable(case_path, "lumpedload"))
-    dcload_df = DataFrame(XLSX.readtable(case_path, "dclumpload"))
-    switch_df = DataFrame(XLSX.readtable(case_path, "hvcb"))
+    # 使用统一的数据加载流程（ETAPImporter + JuliaPowerCase2Jpc_tp）
+    println("正在使用统一数据流程加载电网数据...")
+    julia_case = load_julia_power_data(case_path)
+    jpc_tp, C_sparse = JuliaPowerCase2Jpc_tp(julia_case)
+    println("数据加载完成: AC节点=$(jpc_tp[:nb_ac]), DC节点=$(jpc_tp[:nb_dc])")
 
-    load_df = nrow(load_df_raw) > 0 ? load_df_raw[2:end, :] : load_df_raw
-
-    name_to_index = Dict{String, Int}()
-    VMAX_ac = Float64[]
-    VMIN_ac = Float64[]
-    ac_nodes = Int[]
-
-    for row in eachrow(bus_df)
-        label = _get_label(row, "ID")
-        if isempty(label) || haskey(name_to_index, label)
-            continue
-        end
-        idx = length(name_to_index) + 1
-        name_to_index[label] = idx
-        push!(ac_nodes, idx)
-        push!(VMAX_ac, _get_float(row, "VMaxLimit", 105.0) / 100.0)
-        push!(VMIN_ac, _get_float(row, "VMinLimit", 90.0) / 100.0)
-    end
-
-    VMAX_dc = Float64[]
-    VMIN_dc = Float64[]
-    dc_nodes = Int[]
-    for row in eachrow(dcbus_df)
-        label = _get_label(row, "ID")
-        if isempty(label) || haskey(name_to_index, label)
-            continue
-        end
-        idx = length(name_to_index) + 1
-        name_to_index[label] = idx
-        push!(dc_nodes, idx)
-        push!(VMAX_dc, 1.05)
-        push!(VMIN_dc, 0.90)
-    end
-
-    nb_ac = length(ac_nodes)
-    nb_dc = length(dc_nodes)
+    # 从 jpc_tp 获取基本参数
+    nb_ac = jpc_tp[:nb_ac]
+    nb_dc = jpc_tp[:nb_dc]
     nb = nb_ac + nb_dc
+    nl_ac = jpc_tp[:nl_ac]
+    nl_dc = jpc_tp[:nl_dc]
+    nl_vsc = jpc_tp[:nl_vsc]
+    ng = jpc_tp[:ng]
+    baseMVA = jpc_tp.baseMVA
 
+    # 获取稀疏矩阵
+    Cft_ac = C_sparse[:Cft_ac]
+    Cft_dc = C_sparse[:Cft_dc]
+    Cft_vsc = C_sparse[:Cft_vsc]
+    Cg = C_sparse[:Cg]
+    Cmg = C_sparse[:Cmg]
+    Cd = C_sparse[:Cd]
+
+    # 获取负荷数据（转换为 kW）
+    Pd = jpc_tp[:Pd] .* baseMVA .* 1000  # 标幺值 -> MW -> kW
+    Qd = jpc_tp[:Qd] .* baseMVA .* 1000  # 标幺值 -> MW -> kW
+    
+    # 获取发电机数据（转换为 kW）
+    Pgmax = jpc_tp[:Pgmax] .* baseMVA .* 1000  # MW -> kW
+    Qgmax = jpc_tp[:Qgmax] .* baseMVA .* 1000  # MW -> kW
+    
+    # 获取微网/光伏数据（转换为 kW）
+    Pmgmax = jpc_tp[:Pmgmax] .* baseMVA .* 1000  # MW -> kW
+    Qmgmax = jpc_tp[:Qmgmax] .* baseMVA .* 1000  # MVar -> kVar
+    nmg = jpc_tp[:nmg]
+    
+    # 获取 VSC 数据（转换为 kW）
+    Pvscmax = jpc_tp[:Pvscmax] .* baseMVA .* 1000  # MW -> kW
+    eta_vsc = fill(0.95, nl_vsc)  # 默认效率 95%
+    if size(jpc_tp.converter, 1) > 0 && size(jpc_tp.converter, 2) >= 9
+        for i in 1:nl_vsc
+            eta_vsc[i] = jpc_tp.converter[i, 9] > 0 ? jpc_tp.converter[i, 9] : 0.95
+        end
+    end
+    
+    # 获取线路参数
+    R_ac = nl_ac > 0 ? jpc_tp.branchAC[:, 3] : Float64[]  # R 列
+    X_ac = nl_ac > 0 ? jpc_tp.branchAC[:, 4] : Float64[]  # X 列
+    R_dc = nl_dc > 0 ? jpc_tp.branchDC[:, 3] : Float64[]
+    
+    # 获取线路状态（alpha）
+    alpha_ac = nl_ac > 0 ? Float64.(jpc_tp.branchAC[:, 11]) : Float64[]  # BR_STATUS 列
+    alpha_dc = nl_dc > 0 ? Float64.(jpc_tp.branchDC[:, 11]) : Float64[]
+    alpha_vsc = nl_vsc > 0 ? Float64.(jpc_tp.converter[:, 3]) : Float64[]  # CONV_INSERVICE 列
+    
+    # 获取电压限制
+    VMAX_ac = nb_ac > 0 ? jpc_tp.busAC[:, 12] : Float64[]  # VMAX 列
+    VMIN_ac = nb_ac > 0 ? jpc_tp.busAC[:, 13] : Float64[]  # VMIN 列
+    VMAX_dc = fill(1.05, nb_dc)
+    VMIN_dc = fill(0.90, nb_dc)
+    
+    # 获取线路容量
+    Smax_ac = nl_ac > 0 ? jpc_tp.branchAC[:, 6] : Float64[]  # RATE_A 列
+    Smax_dc = nl_dc > 0 ? jpc_tp.branchDC[:, 6] : Float64[]
+    
+    # 读取开关信息（这部分仍需从 Excel 读取，因为 jpc_tp 没有存储）
+    switch_df = DataFrame(XLSX.readtable(case_path, "hvcb"))
     switch_pairs = Set{Tuple{String, String}}()
     for row in eachrow(switch_df)
         a = _get_label(row, "FromElement")
@@ -356,129 +379,29 @@ function load_hybrid_case(case_path::AbstractString, mess_configs::Vector{MESSCo
         push!(switch_pairs, (a, b))
         push!(switch_pairs, (b, a))
     end
-
-    ac_edges = Tuple{Int, Int}[]
-    R_ac = Float64[]
-    X_ac = Float64[]
-    alpha_ac = Float64[]
-    switch_ac = Float64[]
-
-    for row in eachrow(line_df)
-        from_label = _get_label(row, "FromBus")
-        to_label = _get_label(row, "ToBus")
-        if !haskey(name_to_index, from_label) || !haskey(name_to_index, to_label)
-            continue
-        end
-        frm = name_to_index[from_label]
-        to = name_to_index[to_label]
-        push!(ac_edges, (frm, to))
-        push!(R_ac, _get_float(row, "RPosValue", 0.0))
-        push!(X_ac, _get_float(row, "XPosValue", 0.0))
-        push!(alpha_ac, Float64(_parse_binary(_row_get(row, Symbol("InService"), 1))))
-        push!(switch_ac, (from_label, to_label) in switch_pairs ? 1.0 : 0.0)
-    end
-
-    dc_edges = Tuple{Int, Int}[]
-    R_dc = Float64[]
-    alpha_dc = Float64[]
-    switch_dc = Float64[]
-    for row in eachrow(dc_df)
-        from_label = _get_label(row, "FromBus")
-        to_label = _get_label(row, "ToBus")
-        if !haskey(name_to_index, from_label) || !haskey(name_to_index, to_label)
-            continue
-        end
-        frm = name_to_index[from_label]
-        to = name_to_index[to_label]
-        push!(dc_edges, (frm, to))
-        push!(R_dc, _get_float(row, "RValue", 0.0))
-        push!(alpha_dc, Float64(_parse_binary(_row_get(row, Symbol("InService"), 1))))
-        push!(switch_dc, (from_label, to_label) in switch_pairs ? 1.0 : 0.0)
-    end
-
-    vsc_edges = Tuple{Int, Int}[]
-    Pvscmax = Float64[]
-    eta_vsc = Float64[]
-    alpha_vsc = Float64[]
-    for row in eachrow(inv_df)
-        ac_label = _get_label(row, "BusID")
-        dc_label = _get_label(row, "CZNetwork")
-        if !haskey(name_to_index, ac_label) || !haskey(name_to_index, dc_label)
-            continue
-        end
-        frm = name_to_index[ac_label]
-        to = name_to_index[dc_label]
-        push!(vsc_edges, (frm, to))
-        pmax = max(_get_float(row, "DckW", 0.0), 0.0)
-        eta = _get_float(row, "DcPercentEFF", 95.0) / 100.0
-        push!(Pvscmax, pmax)
-        push!(eta_vsc, clamp(eta, 0.01, 1.0))
-        push!(alpha_vsc, Float64(_parse_binary(_row_get(row, Symbol("InService"), 1))))
-    end
-
-    nl_ac = length(ac_edges)
-    nl_dc = length(dc_edges)
-    nl_vsc = length(vsc_edges)
-
-    Cft_ac = _build_incidence_matrix(ac_edges, nb)
-    Cft_dc = _build_incidence_matrix(dc_edges, nb)
-    Cft_vsc = _build_incidence_matrix(vsc_edges, nb)
-
-    gen_nodes = Int[]
-    Pgmax_list = Float64[]
-    Qgmax_list = Float64[]
-    for row in eachrow(gen_df)
-        bus_label = _get_label(row, "Bus")
-        if !haskey(name_to_index, bus_label)
-            continue
-        end
-        push!(gen_nodes, name_to_index[bus_label])
-        push!(Pgmax_list, _get_float(row, "OpMW", 0.0) * 1000.0)
-        push!(Qgmax_list, _get_float(row, "OpMvar", 0.0) * 1000.0)
-    end
-    Cg = _build_connection_matrix(gen_nodes, nb)
-
-    mg_nodes = Int[]
-    Pmgmax_list = Float64[]
-    for row in eachrow(mg_df)
-        bus_label = _get_label(row, "Bus")
-        if !haskey(name_to_index, bus_label)
-            continue
-        end
-        push!(mg_nodes, name_to_index[bus_label])
-        push!(Pmgmax_list, _get_float(row, "PVAPower", 0.0))
-    end
-    Cmg = _build_connection_matrix(mg_nodes, nb)
-
-    load_nodes = Int[]
-    Pd_list = Float64[]
-    Qd_list = Float64[]
-    for row in eachrow(load_df)
-        bus_label = _get_label(row, "Bus")
-        if !haskey(name_to_index, bus_label)
-            continue
-        end
-        push!(load_nodes, name_to_index[bus_label])
-        demand = _get_float(row, "MVA", 0.0)
-        push!(Pd_list, demand)
-        push!(Qd_list, demand / 5.0)
-    end
-    for row in eachrow(dcload_df)
-        bus_label = _get_label(row, "Bus")
-        if !haskey(name_to_index, bus_label)
-            continue
-        end
-        push!(load_nodes, name_to_index[bus_label])
-        demand_kw = _get_float(row, "KW", 0.0)
-        push!(Pd_list, demand_kw)
-        push!(Qd_list, demand_kw / 5.0)
-    end
-    Cd = _build_connection_matrix(load_nodes, nb)
-
-    Pd = collect(Pd_list)
-    Qd = collect(Qd_list)
+    
+    # 构建开关标志向量（需要根据母线名字判断）
+    # 由于 jpc_tp 没有存储母线名字，暂时设置所有线路都可切换
+    switch_ac = ones(Float64, nl_ac)
+    switch_dc = ones(Float64, nl_dc)
+    switch_vec = vcat(switch_ac, switch_dc, ones(Float64, nl_vsc))
+    
+    # 计算每个节点的负荷
     load_per_node = vec(transpose(Cd) * Pd)
-
+    
+    # 获取发电机和微网节点
+    gen_nodes = ng > 0 ? Int.(round.(jpc_tp.genAC[:, 1])) : Int[]
+    
+    # 微网节点需要从 Cmg 矩阵反推
+    mg_nodes = Int[]
+    for i in 1:nmg
+        node_idx = findfirst(x -> x == 1, Cmg[i, :])
+        if node_idx !== nothing
+            push!(mg_nodes, node_idx)
+        end
+    end
+    
+    # MESS 配置处理
     mess_nodes = Int[]
     mess_charge_max = Float64[]
     mess_discharge_max = Float64[]
@@ -506,21 +429,19 @@ function load_hybrid_case(case_path::AbstractString, mess_configs::Vector{MESSCo
     end
 
     mess_connect = _build_connection_matrix(mess_nodes, nb)
-
-    Smax_ac = fill(4000.0, nl_ac)
-    Smax_dc = fill(4000.0, nl_dc)
-    if nl_dc >= 1
-        Smax_dc[1] = 200.0
-    end
-    if nl_dc >= 2
-        Smax_dc[2] = 20000.0
-    end
-
-    switch_vec = vcat(switch_ac, switch_dc, ones(Float64, nl_vsc))
+    
     line_types = vcat(fill("AC", nl_ac), fill("DC", nl_dc), fill("VSC", nl_vsc))
 
     transport_node_to_grid_map, transport_grid_to_node_map = _build_transport_mapping(nb)
     mess_transport_initial_nodes = _resolve_mess_transport_initial(copy(mess_nodes), transport_grid_to_node_map)
+
+    # 转换矩阵类型为 SparseMatrixCSC{Float64, Int}
+    Cft_ac_f = sparse(Float64.(Cft_ac))
+    Cft_dc_f = sparse(Float64.(Cft_dc))
+    Cft_vsc_f = sparse(Float64.(Cft_vsc))
+    Cg_f = sparse(Float64.(Cg))
+    Cmg_f = sparse(Float64.(Cmg))
+    Cd_f = sparse(Float64.(Cd))
 
     case = HybridGridCase(
         nb,
@@ -529,24 +450,24 @@ function load_hybrid_case(case_path::AbstractString, mess_configs::Vector{MESSCo
         nl_ac,
         nl_dc,
         nl_vsc,
-        length(gen_nodes),
-        length(mg_nodes),
+        ng,
+        nmg,
         length(mess_nodes),
-        Cft_ac,
-        Cft_dc,
-        Cft_vsc,
-        Cg,
-        Cmg,
-        Cd,
+        Cft_ac_f,
+        Cft_dc_f,
+        Cft_vsc_f,
+        Cg_f,
+        Cmg_f,
+        Cd_f,
         Pd,
         Qd,
-        collect(Pgmax_list),
-        collect(Qgmax_list),
-        collect(Pmgmax_list),
-        zeros(length(mg_nodes)),
-        isempty(mg_nodes) ? Float64[] : collect(Pmgmax_list ./ 5.0),
-        zeros(length(mg_nodes)),
-        collect(Pvscmax),
+        Pgmax,
+        Qgmax,
+        Pmgmax,
+        zeros(nmg),
+        Qmgmax,
+        zeros(nmg),
+        Pvscmax,
         collect(eta_vsc),
         Smax_ac,
         Smax_dc,
@@ -579,10 +500,17 @@ function load_hybrid_case(case_path::AbstractString, mess_configs::Vector{MESSCo
         transport_grid_to_node_map,
         mess_transport_initial_nodes,
         mess_names,
-        _row_entries(Cft_ac),
-        _row_entries(Cft_dc),
-        _row_entries(Cft_vsc),
+        _row_entries(Cft_ac_f),
+        _row_entries(Cft_dc_f),
+        _row_entries(Cft_vsc_f),
     )
+
+    println("HybridGridCase 构建完成:")
+    println("  - 节点: AC=$nb_ac, DC=$nb_dc, 总计=$nb")
+    println("  - 线路: AC=$nl_ac, DC=$nl_dc, VSC=$nl_vsc")
+    println("  - 发电机: $ng, 微网: $nmg, MESS: $(length(mess_nodes))")
+    println("  - 总负荷: $(round(sum(Pd), digits=1)) kW")
+    println("  - 微网总容量: $(round(sum(Pmgmax), digits=1)) kW")
 
     return case
 end
@@ -892,7 +820,7 @@ function optimize_hybrid_dispatch(case::HybridGridCase, statuses, weights::Union
     model = Model(Gurobi.Optimizer)
     set_optimizer_attribute(model, "OutputFlag", 1)
     set_optimizer_attribute(model, "LogToConsole", 1)
-    set_optimizer_attribute(model, "TimeLimit", 3600)
+    set_optimizer_attribute(model, "TimeLimit", 360)
     set_optimizer_attribute(model, "MIPGap", 0.01)
 
     objective_expr = JuMP.AffExpr(0.0)
