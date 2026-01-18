@@ -29,6 +29,13 @@ TIME_STEP_HOURS = 1.0
 MESS_TRAVEL_ENERGY_LOSS_PER_HOUR = 0.0
 """每小时在移动过程中被认为的能源消耗量（kW·h）。设为0以消除移动阻碍。"""
 
+NO_POWER_MAX_CONSECUTIVE_HOURS = 2
+NO_POWER_WINDOW = NO_POWER_MAX_CONSECUTIVE_HOURS + 1
+NO_POWER_SOFT_PENALTY = 1e5
+NO_POWER_REL_TOL = 0.02
+NO_POWER_ABS_TOL = 1e-3
+"""连续断电软约束的窗口与惩罚设置。"""
+
 TRANSPORT_NODE_TO_GRID: Mapping[int, int] = {
     1: 5,
     2: 10,
@@ -182,6 +189,19 @@ def _build_connection_matrix(nodes: Sequence[int], num_nodes: int) -> sp.csr_mat
     cols = np.asarray(nodes, dtype=int)
     data = np.ones(len(nodes), dtype=float)
     return sp.coo_matrix((data, (rows, cols)), shape=(len(nodes), num_nodes)).tocsr()
+
+
+def _max_consecutive_true(values: Sequence[float], threshold: float = 0.5) -> int:
+    best = 0
+    current = 0
+    for value in values:
+        if value > threshold:
+            current += 1
+            if current > best:
+                best = current
+        else:
+            current = 0
+    return best
 
 
 def load_hybrid_case(case_path: Path, mess_configs: Sequence[MESSConfig]) -> HybridGridCase:
@@ -861,6 +881,8 @@ def optimize_hybrid_dispatch(
         scenario_mess_dis_vars: List[gp.MVar] = []
         scenario_prec_vars: List[gp.MVar] = []
         scenario_pinv_vars: List[gp.MVar] = []
+        scenario_no_power_vars: List[gp.MVar] = []
+        scenario_no_power_violation_vars: List[gp.Var] = []
         mobility_schedule: MessMobilitySchedule | None = None
         if case.nmess:
             mobility_schedule = _setup_mess_mobility(
@@ -1039,6 +1061,40 @@ def optimize_hybrid_dispatch(
             scenario_shed_vars.append(shed_var)
             scenario_expr += case.c_load * gp.quicksum(shed_var)
 
+            no_power_var = model.addMVar(
+                case.nb,
+                vtype=gp.GRB.BINARY,
+                name=f"no_power[{scenario_idx},{t}]",
+            )
+            scenario_no_power_vars.append(no_power_var)
+            for node_idx in range(case.nb):
+                load_value = float(case.load_per_node[node_idx])
+                if load_value <= NO_POWER_ABS_TOL:
+                    model.addConstr(
+                        no_power_var[node_idx] == 0.0,
+                        name=f"no_power_zero[{scenario_idx},{t},{node_idx}]",
+                    )
+                    continue
+                tolerance = max(NO_POWER_ABS_TOL, NO_POWER_REL_TOL * load_value)
+                powered_upper = max(load_value - tolerance, 0.0)
+                outage_lower = max(load_value - NO_POWER_ABS_TOL, 0.0)
+                model.addGenConstrIndicator(
+                    no_power_var[node_idx],
+                    0,
+                    shed_var[node_idx],
+                    gp.GRB.LESS_EQUAL,
+                    powered_upper,
+                    name=f"no_power_upper[{scenario_idx},{t},{node_idx}]",
+                )
+                model.addGenConstrIndicator(
+                    no_power_var[node_idx],
+                    1,
+                    shed_var[node_idx],
+                    gp.GRB.GREATER_EQUAL,
+                    outage_lower,
+                    name=f"no_power_lower[{scenario_idx},{t},{node_idx}]",
+                )
+
             node_expr = [gp.LinExpr() for _ in range(case.nb)]
 
             if case.nl_ac and ac_var is not None:
@@ -1139,6 +1195,28 @@ def optimize_hybrid_dispatch(
                     name=f"soc_terminal_max[{scenario_idx},{m_idx}]",
                 )
 
+        no_power_penalty_terms: List[gp.Var] = []
+        if scenario_no_power_vars and hours >= NO_POWER_WINDOW:
+            for node_idx in range(case.nb):
+                for t in range(hours - NO_POWER_WINDOW + 1):
+                    viol = model.addVar(
+                        lb=0.0,
+                        name=f"no_power_violation[{scenario_idx},{node_idx},{t}]",
+                    )
+                    window_expr = gp.quicksum(
+                        scenario_no_power_vars[t + offset][node_idx]
+                        for offset in range(NO_POWER_WINDOW)
+                    )
+                    model.addConstr(
+                        window_expr
+                        <= NO_POWER_MAX_CONSECUTIVE_HOURS + viol,
+                        name=f"no_power_window[{scenario_idx},{node_idx},{t}]",
+                    )
+                    no_power_penalty_terms.append(viol)
+        if no_power_penalty_terms:
+            scenario_expr += NO_POWER_SOFT_PENALTY * gp.quicksum(no_power_penalty_terms)
+            scenario_no_power_violation_vars.extend(no_power_penalty_terms)
+
         scenario_records.append(
             {
                 "weight": scenario_weight,
@@ -1152,6 +1230,8 @@ def optimize_hybrid_dispatch(
                 "prec_vars": scenario_prec_vars,
                 "pinv_vars": scenario_pinv_vars,
                 "soc_vars": scenario_soc_vars,
+                "no_power_vars": scenario_no_power_vars,
+                "no_power_violation_vars": scenario_no_power_violation_vars,
             }
         )
         objective += scenario_weight * scenario_expr
@@ -1196,6 +1276,13 @@ def optimize_hybrid_dispatch(
                 record["mess_chg_vars"],
                 record["mess_dis_vars"],
             )
+        no_power_violations: Dict[int, int] = {}
+        if record.get("no_power_vars"):
+            no_power_matrix = np.vstack([var.X for var in record["no_power_vars"]])
+            for node_idx in range(no_power_matrix.shape[1]):
+                max_run = _max_consecutive_true(no_power_matrix[:, node_idx])
+                if max_run > NO_POWER_MAX_CONSECUTIVE_HOURS:
+                    no_power_violations[node_idx + 1] = int(max_run)
         pg_cost = case.c_sg * generation_total
         pm_cost = case.c_mg * microgrid_total
         vsc_cost = case.c_vsc * (prec_total + pinv_total)
@@ -1215,6 +1302,7 @@ def optimize_hybrid_dispatch(
                 "mess_vectors": mess_vectors,
                 "served_ratio": served_ratio,
                 "objective": scenario_objective,
+                "no_power_violations": no_power_violations,
             }
         )
 
@@ -1286,6 +1374,14 @@ def main() -> None:
                     print(f"  → ✅ {mess_name} 发生了移动! 访问了节点: {sorted(unique_locs)}")
                 else:
                     print(f"  → ⚠️ {mess_name} 未移动，始终在节点 {unique_locs}")
+
+        violations = detail.get("no_power_violations", {})
+        if violations:
+            print("\n⚠️ 连续断电超过 2 小时的节点：")
+            for node_id, duration in sorted(violations.items()):
+                print(f"  - 节点 {node_id}: 最长 {duration} 小时无电")
+        else:
+            print("\n所有节点均满足“任意节点连续断电不超过2小时”的软约束。")
 
     print(f"\n{'='*60}")
     print("总结")

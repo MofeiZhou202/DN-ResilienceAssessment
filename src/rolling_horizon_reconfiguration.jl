@@ -284,8 +284,44 @@ function write_dataframe_sheet(workbook, sheet_name::String, df::DataFrame)
     return sheet
 end
 
+function copy_named_sheet!(workbook, source_path::AbstractString, sheet_name::AbstractString)
+    XLSX.openxlsx(source_path) do source_workbook
+        sheet_names = XLSX.sheetnames(source_workbook)
+        if !(sheet_name in sheet_names)
+            error("输入文件 $(source_path) 中未找到名为 $(sheet_name) 的工作表，无法复制。")
+        end
+        source_sheet = XLSX.getsheet(source_workbook, sheet_name)
+        dest_sheet = XLSX.addsheet!(workbook, sheet_name)
+        dims = source_sheet.dimension
+        if dims === nothing
+            return dest_sheet
+        end
+        dim_str = strip(string(dims))
+        if isempty(dim_str)
+            return dest_sheet
+        end
+        refs = split(dim_str, ":")
+        start_ref = refs[1]
+        end_ref = refs[end]
+        start_col, start_row = parse_cell_reference(start_ref)
+        end_col, end_row = parse_cell_reference(end_ref)
+        for row in start_row:end_row
+            for col in start_col:end_col
+                cell = source_sheet[row, col]
+                value = cell isa XLSX.Cell ? cell.value : cell
+                if value !== nothing
+                    XLSX.setdata!(dest_sheet, row - start_row + 1, col - start_col + 1, value)
+                end
+            end
+        end
+        return dest_sheet
+    end
+end
+
 function write_reconfiguration_report(output_path::AbstractString, template_path::AbstractString,
-    template_sheet::AbstractString, results_matrix::Matrix{Int}, raw_df::DataFrame)
+    template_sheet::AbstractString, results_matrix::Matrix{Int}, raw_df::DataFrame;
+    cluster_summary_source::Union{Nothing, AbstractString}=nothing,
+    cluster_summary_sheet::AbstractString="cluster_summary")
     template_df = DataFrame(XLSX.readtable(template_path, template_sheet))
     expected_rows = size(results_matrix, 1)
     if nrow(template_df) != expected_rows
@@ -301,6 +337,9 @@ function write_reconfiguration_report(output_path::AbstractString, template_path
     XLSX.openxlsx(output_path, mode = "w") do workbook
         write_dataframe_sheet(workbook, template_sheet, template_df)
         write_dataframe_sheet(workbook, "RollingDecisionsOriginal", raw_df)
+        if cluster_summary_source !== nothing
+            copy_named_sheet!(workbook, cluster_summary_source, cluster_summary_sheet)
+        end
     end
 end
 
@@ -434,7 +473,9 @@ function run_rolling_reconfiguration(; case_file::AbstractString = DEFAULT_CASE_
     end
     # Retain original status tensor internally but flip values for the exported report
     flipped_matrix = 1 .- results_matrix
-    write_reconfiguration_report(output_file, fault_file, fault_sheet, flipped_matrix, results_df)
+    write_reconfiguration_report(output_file, fault_file, fault_sheet, flipped_matrix, results_df;
+        cluster_summary_source=fault_file,
+        cluster_summary_sheet="cluster_summary")
     color_stage_font_via_python(output_file, stage_schedule, scenario_count, lines_per_scenario, n_steps)
     println("滚动拓扑重构完成，结果已写入：", output_file)
     return results_df

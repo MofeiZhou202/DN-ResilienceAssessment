@@ -22,6 +22,12 @@ const DEFAULT_HOURS = 48
 const TIME_STEP_HOURS = 1.0
 const MESS_TRAVEL_ENERGY_LOSS_PER_HOUR = 0.0
 
+const NO_POWER_MAX_CONSECUTIVE_HOURS = 2
+const NO_POWER_WINDOW = NO_POWER_MAX_CONSECUTIVE_HOURS + 1
+const NO_POWER_SOFT_PENALTY = 1.0e5
+const NO_POWER_REL_TOL = 0.02
+const NO_POWER_ABS_TOL = 1e-3
+
 const TRANSPORT_NODE_TO_GRID = Dict(
     1 => 5,
     2 => 10,
@@ -250,6 +256,20 @@ function _build_connection_matrix(nodes::Vector{Int}, num_nodes::Int)
     J = nodes
     V = ones(Float64, n)
     return sparse(I, J, V, n, num_nodes)
+end
+
+function _max_consecutive_true(values::AbstractVector{<:Real}; threshold::Float64=0.5)
+    best = 0
+    current = 0
+    for value in values
+        if value > threshold
+            current += 1
+            best = max(best, current)
+        else
+            current = 0
+        end
+    end
+    return best
 end
 
 function _row_entries(mat::SparseMatrixCSC{Float64, Int})
@@ -842,6 +862,8 @@ function optimize_hybrid_dispatch(case::HybridGridCase, statuses, weights::Union
         scenario_pm_vars = Any[]
         scenario_prec_vars = Any[]
         scenario_pinv_vars = Any[]
+        scenario_no_power_vars = Any[]
+        scenario_no_power_violation_vars = Any[]
 
         if case.nmess > 0
             scenario_mobility = _setup_mess_mobility(model, case, hours, "s$(scenario_idx)")
@@ -953,6 +975,24 @@ function optimize_hybrid_dispatch(case::HybridGridCase, statuses, weights::Union
                 add_to_expression!(objective_expr, scenario_weight * case.c_load, shed_var[node])
             end
 
+            no_power_var = @variable(model, [node=1:case.nb], Bin, base_name="no_power[$(scenario_idx),$(t)]")
+            push!(scenario_no_power_vars, no_power_var)
+            for node in 1:case.nb
+                load_value = case.load_per_node[node]
+                if load_value <= NO_POWER_ABS_TOL
+                    fix(no_power_var[node], 0.0; force=true)
+                    continue
+                end
+                tolerance = max(NO_POWER_ABS_TOL, NO_POWER_REL_TOL * load_value)
+                powered_upper = max(load_value - tolerance, 0.0)
+                outage_lower = max(load_value - NO_POWER_ABS_TOL, 0.0)
+                bigM = load_value + NO_POWER_ABS_TOL
+                @constraint(model, shed_var[node] <= powered_upper + bigM * no_power_var[node])
+                if outage_lower > 0
+                    @constraint(model, shed_var[node] >= outage_lower - bigM * (1.0 - no_power_var[node]))
+                end
+            end
+
             node_expr = [JuMP.AffExpr(0.0) for _ in 1:case.nb]
 
             if case.nl_ac > 0 && ac_var !== nothing
@@ -1035,6 +1075,21 @@ function optimize_hybrid_dispatch(case::HybridGridCase, statuses, weights::Union
             end
         end
 
+        if !isempty(scenario_no_power_vars) && hours >= NO_POWER_WINDOW
+            for node in 1:case.nb
+                for window_start in 1:(hours - NO_POWER_WINDOW + 1)
+                    viol = @variable(model, lower_bound=0.0, base_name="no_power_violation[$(scenario_idx),$(node),$(window_start)]")
+                    window_sum = JuMP.AffExpr(0.0)
+                    for offset in 0:(NO_POWER_WINDOW - 1)
+                        add_to_expression!(window_sum, 1.0, scenario_no_power_vars[window_start + offset][node])
+                    end
+                    @constraint(model, window_sum <= NO_POWER_MAX_CONSECUTIVE_HOURS + viol)
+                    add_to_expression!(objective_expr, scenario_weight * NO_POWER_SOFT_PENALTY, viol)
+                    push!(scenario_no_power_violation_vars, viol)
+                end
+            end
+        end
+
         push!(scenario_records, Dict(
             :weight => scenario_weight,
             :hours => hours,
@@ -1047,6 +1102,8 @@ function optimize_hybrid_dispatch(case::HybridGridCase, statuses, weights::Union
             :prec_vars => scenario_prec_vars,
             :pinv_vars => scenario_pinv_vars,
             :soc_vars => scenario_soc_vars,
+            :no_power_vars => scenario_no_power_vars,
+            :no_power_violation_vars => scenario_no_power_violation_vars,
         ))
     end
 
@@ -1083,6 +1140,17 @@ function optimize_hybrid_dispatch(case::HybridGridCase, statuses, weights::Union
             mobility_log = _collect_mobility_log(case, record[:mobility_schedule], hours)
             mess_vectors = _collect_mess_vectors(case, record[:mobility_schedule], hours, record[:mess_chg_vars], record[:mess_dis_vars])
         end
+        no_power_violations = Dict{Int, Int}()
+        if haskey(record, :no_power_vars) && !isempty(record[:no_power_vars])
+            num_steps = length(record[:no_power_vars])
+            for node in 1:case.nb
+                values = [value(record[:no_power_vars][t][node]) for t in 1:num_steps]
+                max_run = _max_consecutive_true(values)
+                if max_run > NO_POWER_MAX_CONSECUTIVE_HOURS
+                    no_power_violations[node] = max_run
+                end
+            end
+        end
         pg_cost = case.c_sg * generation_total
         pm_cost = case.c_mg * microgrid_total
         vsc_cost = case.c_vsc * (prec_total + pinv_total)
@@ -1101,6 +1169,7 @@ function optimize_hybrid_dispatch(case::HybridGridCase, statuses, weights::Union
             "mess_vectors" => mess_vectors,
             "served_ratio" => served_ratio,
             "objective" => scenario_objective,
+            "no_power_violations" => no_power_violations,
         ))
     end
 
@@ -1136,6 +1205,8 @@ function run_mess_dispatch_julia(; case_path::AbstractString=DEFAULT_CASE_XLSX,
     model, result = optimize_hybrid_dispatch(case, statuses, weights)
     scenario_details = result["scenario_results"]
     total_scenarios = length(scenario_details)
+    node_violation_prob = Dict{Int, Float64}()
+    node_violation_breakdown = Dict{Int, Dict{Int, Float64}}()
 
     for (idx, detail) in enumerate(scenario_details)
         label = idx <= length(labels) ? labels[idx] : "Scenario $(idx)"
@@ -1166,6 +1237,52 @@ function run_mess_dispatch_julia(; case_path::AbstractString=DEFAULT_CASE_XLSX,
                 else
                     println("  → ⚠️ $(mess_name) 未移动，始终在节点 $(unique_locs)")
                 end
+            end
+        end
+
+        violations = detail["no_power_violations"]
+        if !isempty(violations)
+            println("\n⚠️ 场景 $(idx) 中连续断电超过 $(NO_POWER_MAX_CONSECUTIVE_HOURS) 小时的节点：")
+            for node_id in sort(collect(keys(violations)))
+                duration = violations[node_id]
+                println("  - 节点 $(node_id): 最长 $(duration) 小时无电")
+                scenario_prob = prob
+                stats = get!(node_violation_breakdown, node_id, Dict{Int, Float64}())
+                stats[duration] = get(stats, duration, 0.0) + scenario_prob
+                node_violation_prob[node_id] = get(node_violation_prob, node_id, 0.0) + scenario_prob
+            end
+        else
+            println("\n场景 $(idx) 中所有节点均满足“任意节点连续断电不超过$(NO_POWER_MAX_CONSECUTIVE_HOURS)小时”的软约束。")
+        end
+    end
+
+    println("\n" * "="^60)
+    println("全局连续断电超标节点（汇总全部场景）")
+    println("="^60)
+    if isempty(node_violation_prob)
+        println("  - 所有节点在全部场景中均满足连续断电约束。")
+    else
+        for node_id in sort(collect(keys(node_violation_prob)))
+            stats = node_violation_breakdown[node_id]
+            longest = maximum(keys(stats))
+            total_prob = node_violation_prob[node_id]
+            @printf("  - 节点 %d: 最长连续 %d 小时，累计超标概率 %.4f\n", node_id, longest, total_prob)
+        end
+    end
+
+    println("\n" * "="^60)
+    println("节点连续断电概率统计（汇总全部场景）")
+    println("="^60)
+    for node_id in 1:case.nb
+        total_prob = get(node_violation_prob, node_id, 0.0)
+        compliance_prob = max(0.0, 1.0 - total_prob)
+        stats = get(node_violation_breakdown, node_id, nothing)
+        if stats === nothing
+            @printf("  - 节点 %d: 始终满足约束 (概率 %.4f)\n", node_id, 1.0)
+        else
+            @printf("  - 节点 %d: 超标概率 %.4f, 满足概率 %.4f\n", node_id, total_prob, compliance_prob)
+            for duration in sort(collect(keys(stats)))
+                @printf("      · 最长 %d 小时: 场景概率 %.4f\n", duration, stats[duration])
             end
         end
     end

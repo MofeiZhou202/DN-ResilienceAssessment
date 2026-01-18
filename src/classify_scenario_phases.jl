@@ -245,10 +245,49 @@ function write_dataframe_sheet(workbook, sheet_name::String, df::DataFrame)
     return sheet
 end
 
-function write_phase_report(output_path::AbstractString, detail_df::DataFrame, summary_df::DataFrame)
+function copy_named_sheet!(workbook, source_path::AbstractString, sheet_name::AbstractString)
+    XLSX.openxlsx(source_path) do source_workbook
+        sheet_names = XLSX.sheetnames(source_workbook)
+        if !(sheet_name in sheet_names)
+            error("输入文件 $(source_path) 中未找到名为 $(sheet_name) 的工作表，无法复制。")
+        end
+        source_sheet = XLSX.getsheet(source_workbook, sheet_name)
+        dest_sheet = XLSX.addsheet!(workbook, sheet_name)
+        dims = source_sheet.dimension
+        if dims === nothing
+            return dest_sheet
+        end
+        dim_str = strip(string(dims))
+        if isempty(dim_str)
+            return dest_sheet
+        end
+        refs = split(dim_str, ":")
+        start_ref = refs[1]
+        end_ref = refs[end]
+        start_col, start_row = parse_cell_reference(start_ref)
+        end_col, end_row = parse_cell_reference(end_ref)
+        for row in start_row:end_row
+            for col in start_col:end_col
+                cell = source_sheet[row, col]
+                value = cell isa XLSX.Cell ? cell.value : cell
+                if value !== nothing
+                    XLSX.setdata!(dest_sheet, row - start_row + 1, col - start_col + 1, value)
+                end
+            end
+        end
+        return dest_sheet
+    end
+end
+
+function write_phase_report(output_path::AbstractString, detail_df::DataFrame, summary_df::DataFrame;
+        cluster_summary_source::Union{Nothing, AbstractString}=nothing,
+        cluster_summary_sheet::AbstractString="cluster_summary")
     XLSX.openxlsx(output_path, mode = "w") do workbook
         write_dataframe_sheet(workbook, "StageDetails", detail_df)
         write_dataframe_sheet(workbook, "ScenarioSummary", summary_df)
+        if cluster_summary_source !== nothing
+            copy_named_sheet!(workbook, cluster_summary_source, cluster_summary_sheet)
+        end
     end
 end
 
@@ -264,7 +303,9 @@ function classify_phases(;input_path::AbstractString,
         lines_per_scenario=lines_per_scenario,
         minutes_per_step=minutes_per_step,
         stage2_minutes=stage2_minutes)
-    write_phase_report(output_path, detail_df, summary_df)
+    write_phase_report(output_path, detail_df, summary_df;
+        cluster_summary_source=input_path,
+        cluster_summary_sheet="cluster_summary")
     return detail_df, summary_df
 end
 
