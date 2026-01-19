@@ -18,6 +18,7 @@ const VariableRef = JuMP.VariableRef
 const DEFAULT_CASE_XLSX = joinpath(@__DIR__, "..", "data", "ac_dc_real_case.xlsx")
 const DEFAULT_TOPOLOGY_XLSX = joinpath(@__DIR__, "..", "data", "topology_reconfiguration_results.xlsx")
 const DEFAULT_MC_XLSX = joinpath(@__DIR__, "..", "data", "mc_simulation_results_k100_clusters.xlsx")
+const DEFAULT_DISPATCH_REPORT_XLSX = joinpath(@__DIR__, "..", "output", "mess_dispatch_report.xlsx")
 const DEFAULT_HOURS = 48
 const TIME_STEP_HOURS = 1.0
 const MESS_TRAVEL_ENERGY_LOSS_PER_HOUR = 0.0
@@ -36,6 +37,61 @@ const TRANSPORT_NODE_TO_GRID = Dict(
     5 => 25,
     6 => 30,
 )
+
+function _ensure_parent_dir(path::AbstractString)
+    dir = dirname(path)
+    if !isdir(dir)
+        Base.Filesystem.mkpath(dir)
+    end
+end
+
+function _write_df_sheet!(workbook, sheet_name::AbstractString, df::DataFrame)
+    sheet = XLSX.addsheet!(workbook, sheet_name)
+    for (col_idx, name) in enumerate(names(df))
+        sheet[1, col_idx] = String(name)
+        for (row_idx, value) in enumerate(df[!, col_idx])
+            sheet[row_idx + 1, col_idx] = value
+        end
+    end
+end
+
+function _export_mess_report(output_path::AbstractString, result::Dict{String, Any}, node_violation_prob::Dict{Int, Float64}, node_violation_breakdown::Dict{Int, Dict{Int, Float64}})
+    _ensure_parent_dir(output_path)
+    summary_df = DataFrame(
+        指标 = ["期望调度目标", "期望削减负荷 (kW·h)", "期望供电率 (%)"],
+        数值 = [
+            round(result["objective"], digits=4),
+            round(result["expected_load_shed_total"], digits=4),
+            round(result["expected_supply_ratio"] * 100, digits=2),
+        ],
+    )
+
+    violation_df = if isempty(node_violation_prob)
+        DataFrame(信息 = ["所有节点在全部场景中均满足连续断电约束"])
+    else
+        rows = NamedTuple[]
+        for node_id in sort(collect(keys(node_violation_prob)))
+            stats = node_violation_breakdown[node_id]
+            durations = sort(collect(keys(stats)))
+            breakdown = join([@sprintf("%d 小时: %.4f", duration, stats[duration]) for duration in durations], " | ")
+            total_prob = node_violation_prob[node_id]
+            compliance_prob = max(0.0, 1.0 - total_prob)
+            push!(rows, (
+                节点 = node_id,
+                最长连续断电小时 = maximum(durations),
+                超标概率 = round(total_prob, digits=4),
+                满足概率 = round(compliance_prob, digits=4),
+                概率分布 = breakdown,
+            ))
+        end
+        DataFrame(rows)
+    end
+
+    XLSX.openxlsx(output_path, mode = "w") do workbook
+        _write_df_sheet!(workbook, "Summary", summary_df)
+        _write_df_sheet!(workbook, "NoPowerViolations", violation_df)
+    end
+end
 
 struct TrafficArc
     origin::Int
@@ -840,7 +896,7 @@ function optimize_hybrid_dispatch(case::HybridGridCase, statuses, weights::Union
     model = Model(Gurobi.Optimizer)
     set_optimizer_attribute(model, "OutputFlag", 1)
     set_optimizer_attribute(model, "LogToConsole", 1)
-    set_optimizer_attribute(model, "TimeLimit", 360)
+    set_optimizer_attribute(model, "TimeLimit",200)
     set_optimizer_attribute(model, "MIPGap", 0.01)
 
     objective_expr = JuMP.AffExpr(0.0)
@@ -1187,8 +1243,9 @@ function optimize_hybrid_dispatch(case::HybridGridCase, statuses, weights::Union
 end
 
 function run_mess_dispatch_julia(; case_path::AbstractString=DEFAULT_CASE_XLSX,
-        topology_path::AbstractString=DEFAULT_TOPOLOGY_XLSX,
-        fallback_topology::AbstractString=DEFAULT_MC_XLSX,
+    topology_path::AbstractString=DEFAULT_TOPOLOGY_XLSX,
+    fallback_topology::AbstractString=DEFAULT_MC_XLSX,
+    output_file::AbstractString=DEFAULT_DISPATCH_REPORT_XLSX,
         hours::Int=DEFAULT_HOURS,
         mess_configs::Vector{MESSConfig}=DEFAULT_MESS)
     println("\n" * "="^60)
@@ -1293,6 +1350,9 @@ function run_mess_dispatch_julia(; case_path::AbstractString=DEFAULT_CASE_XLSX,
     @printf("期望调度目标: %.4f\n", result["objective"])
     @printf("期望削减负荷: %.4f kW·h\n", result["expected_load_shed_total"])
     @printf("期望供电率: %.2f%%\n", result["expected_supply_ratio"] * 100)
+
+    _export_mess_report(output_file, result, node_violation_prob, node_violation_breakdown)
+    println("调度结果已导出到 $(output_file)")
 
     return model, result
 end

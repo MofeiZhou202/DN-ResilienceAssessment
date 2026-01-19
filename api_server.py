@@ -169,6 +169,7 @@ def mess_dispatch_route():
             "case_path": _normalize_path(payload.get("case_path")),
             "topology_path": _normalize_path(payload.get("topology_path")),
             "fallback_topology": _normalize_path(payload.get("fallback_topology")),
+            "output_file": _normalize_path(payload.get("output_file")),
         }
         _call_workflow("run_mess_dispatch", args)
         return _success("MESS 协同调度已完成", requested_args=args)
@@ -215,6 +216,7 @@ def full_pipeline_route():
                 "case_path": _normalize_path(dispatch_args.get("case_path")),
                 "topology_path": _normalize_path(dispatch_args.get("topology_path")),
                 "fallback_topology": _normalize_path(dispatch_args.get("fallback_topology")),
+                "output_file": _normalize_path(dispatch_args.get("output_file")),
             },
         )
         return _success("完整流程已成功执行")

@@ -134,21 +134,26 @@ end
 function run_mess_dispatch(; 
     case_path::Union{Nothing, String} = nothing,
     topology_path::Union{Nothing, String} = nothing,
-    fallback_topology::Union{Nothing, String} = nothing)
+    fallback_topology::Union{Nothing, String} = nothing,
+    output_file::Union{Nothing, String} = nothing)
     default_case = DEFAULT_CASE_XLSX
     default_topology = DEFAULT_TOPOLOGY_XLSX
     default_fallback = DEFAULT_MC_XLSX
+    default_output = DEFAULT_DISPATCH_REPORT_XLSX
 
     selected_case = _resolve_path_arg(case_path, "请输入混合配电网算例输入路径", default_case)
     selected_topology = _resolve_path_arg(topology_path, "请输入拓扑重构结果文件路径", default_topology)
     selected_fallback = _resolve_path_arg(fallback_topology, "请输入拓扑缺失回退文件路径", default_fallback)
+    selected_output = _resolve_path_arg(output_file, "请输入调度结果Excel输出路径", default_output)
 
     run_mess_dispatch_julia(
         case_path = selected_case,
         topology_path = selected_topology,
         fallback_topology = selected_fallback,
+        output_file = selected_output,
     )
     println("✓ MESS协同调度完成")
+    println("  输出文件: $(selected_output)")
 end
 
 function run_typhoon_workflow(; command::Union{Nothing, String} = nothing)
