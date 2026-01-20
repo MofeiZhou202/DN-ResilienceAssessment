@@ -22,6 +22,9 @@ os.environ.setdefault("JULIA_PROJECT", str(PROJECT_ROOT))
 
 app = Flask(__name__)
 
+# 限制上传文件最大100MB
+app.config['MAX_CONTENT_LENGTH'] = 100 * 1024 * 1024  # 100MB
+
 
 class WorkflowRuntime:
     """惰性初始化 Julia 运行时并暴露 Workflows 模块。"""
@@ -129,6 +132,161 @@ def _parse_command(command: Any) -> List[str]:
     raise ValueError("command 字段必须是字符串或字符串数组")
 
 
+def _stringify_command(command: Any) -> Optional[str]:
+    if command is None:
+        return None
+    if isinstance(command, str):
+        stripped = command.strip()
+        return stripped or None
+    if isinstance(command, (list, tuple)):
+        parts = [str(part).strip() for part in command if str(part).strip()]
+        return " ".join(parts) if parts else None
+    raise ValueError("command 字段必须是字符串或字符串数组")
+
+
+# ==================== 文件上传端点 ====================
+
+@app.route("/api/upload", methods=["POST"])
+def upload_file_route():
+    """
+    上传文件到API服务器并返回临时路径
+    
+    用法：
+    客户端发送 multipart/form-data 请求，包含文件字段：
+    - file: 要上传的文件
+    
+    支持的文件类型：.xlsx, .xls, .csv, .json, .txt
+    文件大小限制：100MB
+    
+    返回：
+    {
+        "status": "success",
+        "message": "文件上传成功",
+        "file_path": "/path/to/temp/upload_xxx.xlsx",
+        "file_name": "TowerSeg.xlsx",
+        "file_size": 12345
+    }
+    """
+    # 检查是否有文件
+    if 'file' not in request.files:
+        return _error("未提供文件，请使用 'file' 字段上传", status=400)
+    
+    file = request.files['file']
+    
+    # 检查文件名是否为空
+    if file.filename == '':
+        return _error("文件名为空", status=400)
+    
+    filename = file.filename
+    
+    # 验证文件类型
+    allowed_extensions = {'.xlsx', '.xls', '.csv', '.json', '.txt', '.dat'}
+    file_ext = Path(filename).suffix.lower()
+    if file_ext not in allowed_extensions:
+        return _error(
+            f"不支持的文件类型: {file_ext}。支持的类型: {', '.join(allowed_extensions)}",
+            status=400
+        )
+    
+    # 检查文件大小
+    file.seek(0, os.SEEK_END)
+    file_size = file.tell()
+    file.seek(0)
+    
+    max_size = 100 * 1024 * 1024  # 100MB
+    if file_size > max_size:
+        return _error(f"文件过大，最大允许 {max_size // (1024*1024)}MB", status=400)
+    
+    # 生成唯一文件名
+    temp_name = f"upload_{uuid.uuid4().hex}{file_ext}"
+    temp_path = TEMP_UPLOAD_DIR / temp_name
+    
+    # 保存文件
+    try:
+        file.save(str(temp_path))
+    except Exception as e:
+        return _error(f"文件保存失败: {str(e)}", status=500)
+    
+    print(f"[upload] 文件已上传: {filename} -> {temp_path} ({file_size} bytes)")
+    
+    return _success(
+        "文件上传成功",
+        file_path=str(temp_path),
+        file_name=filename,
+        file_size=file_size
+    )
+
+
+@app.route("/api/upload-multiple", methods=["POST"])
+def upload_multiple_files_route():
+    """
+    批量上传多个文件到API服务器
+    
+    用法：
+    客户端发送 multipart/form-data 请求，包含多个文件字段：
+    - tower-excel: 配电网结构文件
+    - case-file: 案例文件
+    - fault-file: 故障文件
+    - 等等...
+    
+    返回：
+    {
+        "status": "success",
+        "message": "文件上传成功",
+        "files": {
+            "tower-excel": {"path": "/path/...", "name": "...", "size": 123},
+            "case-file": {"path": "/path/...", "name": "...", "size": 456}
+        }
+    }
+    """
+    if not request.files:
+        return _error("未提供任何文件", status=400)
+    
+    uploaded_files = {}
+    
+    for field_name in request.files:
+        file = request.files[field_name]
+        if file.filename == '':
+            continue
+        
+        # 验证文件类型
+        file_ext = Path(file.filename).suffix.lower()
+        allowed_extensions = {'.xlsx', '.xls', '.csv', '.json', '.txt', '.dat'}
+        if file_ext not in allowed_extensions:
+            continue
+        
+        # 检查文件大小
+        file.seek(0, os.SEEK_END)
+        file_size = file.tell()
+        file.seek(0)
+        max_size = 100 * 1024 * 1024  # 100MB
+        if file_size > max_size:
+            continue
+        
+        # 保存文件
+        temp_name = f"upload_{uuid.uuid4().hex}{file_ext}"
+        temp_path = TEMP_UPLOAD_DIR / temp_name
+        file.save(str(temp_path))
+        
+        uploaded_files[field_name] = {
+            "path": str(temp_path),
+            "name": file.filename,
+            "size": file_size
+        }
+    
+    if not uploaded_files:
+        return _error("没有有效的文件被上传", status=400)
+    
+    print(f"[upload-multiple] 批量上传完成: {len(uploaded_files)} 个文件")
+    
+    return _success(
+        f"成功上传 {len(uploaded_files)} 个文件",
+        files=uploaded_files
+    )
+
+
+# ==================== 原有API端点 ====================
+
 @app.route("/api/classify-phases", methods=["POST"])
 def classify_phases_route():
     try:
@@ -229,20 +387,133 @@ def full_pipeline_route():
         return _error(str(exc))
 
 
+@app.route("/api/typhoon-one-click", methods=["POST"])
+def typhoon_full_generation_route():
+    """触发 main.jl 功能4（台风场景生成工作流）并对外暴露。"""
+    try:
+        if request.is_json:
+            payload = _extract_payload()
+        else:
+            payload = {**request.form}
+
+        command_value = _stringify_command(payload.get("command"))
+        args = {
+            "command": command_value,
+            "tower_excel": _normalize_path(payload.get("tower_excel")),
+            "final_output": _normalize_path(payload.get("final_output")),
+        }
+        _call_workflow("run_typhoon_workflow", args)
+
+        return _success(
+            "台风场景全流程生成已启动",
+            requested_args={k: v for k, v in args.items() if v is not None},
+        )
+    except Exception as exc:  # pylint: disable=broad-except
+        return _error(str(exc))
+
+
 @app.route("/api/typhoon-workflow", methods=["POST"])
 def typhoon_workflow_route():
+    """
+    执行台风工作流
+    
+    请求格式（支持两种方式）：
+    
+    方式1：直接上传文件并执行（推荐）
+    POST /api/typhoon-workflow
+    Content-Type: multipart/form-data
+    file: <TowerSeg.xlsx>
+    command: --one-click
+    
+    方式2：使用已上传文件的路径
+    POST /api/typhoon-workflow
+    Content-Type: application/json
+    {
+        "command": ["--one-click", "--tower-excel", "/path/to/upload_xxx.xlsx"]
+    }
+    """
     try:
-        payload = _extract_payload()
-        command = _parse_command(payload.get("command"))
+        # 处理文件上传和命令混合的情况
+        command = None
+        uploaded_file_path = None
+        
+        # 检查是否有文件上传
+        if 'file' in request.files:
+            file = request.files['file']
+            if file.filename != '':
+                # 上传文件
+                file_ext = Path(file.filename).suffix.lower()
+                allowed_extensions = {'.xlsx', '.xls', '.csv', '.json', '.txt', '.dat'}
+                if file_ext not in allowed_extensions:
+                    return _error(f"不支持的文件类型: {file_ext}", status=400)
+                
+                file.seek(0, os.SEEK_END)
+                file_size = file.tell()
+                file.seek(0)
+                max_size = 100 * 1024 * 1024
+                if file_size > max_size:
+                    return _error(f"文件过大，最大允许 {max_size // (1024*1024)}MB", status=400)
+                
+                temp_name = f"upload_{uuid.uuid4().hex}{file_ext}"
+                temp_path = TEMP_UPLOAD_DIR / temp_name
+                file.save(str(temp_path))
+                uploaded_file_path = str(temp_path)
+                print(f"[typhoon-workflow] 文件已上传: {file.filename} -> {uploaded_file_path}")
+        
+        # 解析命令
+        if request.is_json:
+            payload = _extract_payload()
+            command = _parse_command(payload.get("command"))
+        else:
+            # 从表单数据获取命令
+            command_str = request.form.get('command', '')
+            command = _parse_command(command_str) if command_str else []
+        
         if not command:
             raise ValueError("command 字段不能为空")
+        
+        # 如果上传了文件，自动替换命令中的文件路径
+        if uploaded_file_path:
+            # 查找命令中的文件路径参数并替换
+            new_command = []
+            for i, part in enumerate(command):
+                if part.startswith('--') and i + 1 < len(command):
+                    # 这是一个参数，检查下一个值是否是相对路径
+                    next_val = command[i + 1]
+                    if not next_val.startswith('/') and not next_val.startswith('http'):
+                        # 这是一个相对路径，替换为上传的文件路径
+                        new_command.extend([part, uploaded_file_path])
+                    else:
+                        new_command.append(part)
+                else:
+                    # 检查这个part本身是否是相对路径
+                    if not part.startswith('-') and not part.startswith('/') and not part.startswith('http'):
+                        if i > 0 and command[i-1].startswith('--'):
+                            # 这是上一个参数的值，如果还没处理过
+                            if not new_command or new_command[-1] != command[i-1]:
+                                new_command.append(part)
+                        elif '.' in part:
+                            # 可能是文件路径，但不确定是哪个参数
+                            new_command.append(part)
+                        else:
+                            new_command.append(part)
+                    else:
+                        new_command.append(part)
+            command = new_command
+        
+        # 执行工作流
+        print(f"[typhoon-workflow] 执行命令: {command}")
         try:
             typhoon_cli.main(command)
         except SystemExit as exc:  # 捕获 argparse 内部的 sys.exit
             if exc.code not in (None, 0):
                 raise RuntimeError(f"台风工作流提前退出: {exc.code}") from exc
-        return _success("台风工作流已执行", command=command)
+        
+        return _success("台风工作流已执行", command=command, uploaded_file=uploaded_file_path)
     except Exception as exc:  # pylint: disable=broad-except
+        import traceback
+        error_detail = traceback.format_exc()
+        print(f"[typhoon-workflow] 错误: {error_detail}")
         return _error(str(exc))
 
 
