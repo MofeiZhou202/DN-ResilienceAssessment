@@ -64,7 +64,7 @@ function _resolve_path_arg(value::Union{Nothing, String}, label::String, default
     return normalized
 end
 
-function run_classify_phases(; 
+function run_classify_phases(;
     input_path::Union{Nothing, String} = nothing,
     output_path::Union{Nothing, String} = nothing,
     lines_per_scenario::Int = 35,
@@ -135,15 +135,16 @@ function run_rolling_reconfig(;
     return results_df
 end
 
-function run_mess_dispatch(; 
+function run_mess_dispatch(;
     case_path::Union{Nothing, String} = nothing,
     topology_path::Union{Nothing, String} = nothing,
     fallback_topology::Union{Nothing, String} = nothing,
     output_file::Union{Nothing, String} = nothing)
-    default_case = DEFAULT_CASE_XLSX
-    default_topology = DEFAULT_TOPOLOGY_XLSX
-    default_fallback = DEFAULT_MC_XLSX
-    default_output = DEFAULT_DISPATCH_REPORT_XLSX
+    # ✅ 修复：直接使用路径，不依赖dispatch_main.jl中未导出的常量
+    default_case = joinpath(ROOT_DIR, "data", "ac_dc_real_case.xlsx")
+    default_topology = joinpath(ROOT_DIR, "data", "topology_reconfiguration_results.xlsx")
+    default_fallback = joinpath(ROOT_DIR, "data", "mc_simulation_results_k100_clusters.xlsx")
+    default_output = joinpath(ROOT_DIR, "data", "mess_dispatch_report.xlsx")
 
     selected_case = _resolve_path_arg(case_path, "请输入混合配电网算例输入路径", default_case)
     selected_topology = _resolve_path_arg(topology_path, "请输入拓扑重构结果文件路径", default_topology)

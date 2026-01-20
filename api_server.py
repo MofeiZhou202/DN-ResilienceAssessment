@@ -10,6 +10,7 @@ import time
 from urllib.parse import urlsplit
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+import threading
 
 from flask import Flask, jsonify, request
 
@@ -55,6 +56,7 @@ class WorkflowRuntime:
 
 
 runtime = WorkflowRuntime()
+JULIA_LOCK = threading.Lock()
 
 
 def _normalize_path(value: Optional[str]) -> Optional[str]:
@@ -106,15 +108,16 @@ def _extract_payload() -> Dict[str, Any]:
 
 
 def _call_workflow(func_name: str, arguments: Dict[str, Any]) -> Any:
-    workflows = runtime.workflows
-    func = getattr(workflows, func_name)
     kwargs = {key: value for key, value in arguments.items() if value is not None}
-    try:
-        return func(**kwargs)
-    except SystemExit as exc:  # noqa: PERF203 -- 防止工作流意外退出服务器
-        if exc.code not in (None, 0):
-            raise RuntimeError(f"工作流 {func_name} 提前退出: {exc.code}") from exc
-        return None
+    with JULIA_LOCK:  # 防止 PyJulia 并发调用导致内存访问错误
+        workflows = runtime.workflows
+        func = getattr(workflows, func_name)
+        try:
+            return func(**kwargs)
+        except SystemExit as exc:  # noqa: PERF203 -- 防止工作流意外退出服务器
+            if exc.code not in (None, 0):
+                raise RuntimeError(f"工作流 {func_name} 提前退出: {exc.code}") from exc
+            return None
 
 
 def _success(message: str, **data: Any):
