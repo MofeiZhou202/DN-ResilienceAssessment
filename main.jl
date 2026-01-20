@@ -6,6 +6,8 @@ DN-ResilienceAssessment 配电网韧性评估系统 - Julia主入口
 2. 滚动拓扑重构 (rolling_horizon_reconfiguration.jl)  
 3. 混合配电网+MESS协同调度 (通过PyCall调用Python)
 4. 台风场景生成工作流 (通过PyCall调用app.py)
+5. 完整流程（1→2→3）
+6. 完整弹性评估（4+5融合，一键执行）
 
 使用方法：
     julia main.jl                    # 交互式菜单
@@ -13,6 +15,7 @@ DN-ResilienceAssessment 配电网韧性评估系统 - Julia主入口
     julia main.jl --reconfig         # 滚动拓扑重构
     julia main.jl --dispatch         # MESS协同调度
     julia main.jl --typhoon          # 台风场景生成菜单
+    julia main.jl --resilience       # 完整弹性评估（推荐）
 """
 
 using Pkg
@@ -65,6 +68,8 @@ function main()
             run_typhoon_workflow(command = command)
         elseif arg == "--full"
             run_full_pipeline()
+        elseif arg == "--resilience"
+            run_resilience_assessment()
         elseif arg == "--help" || arg == "-h"
             show_help()
         else
@@ -88,6 +93,8 @@ function main()
         run_typhoon_workflow()
     elseif choice == "5"
         run_full_pipeline()
+    elseif choice == "6"
+        run_resilience_assessment()
     elseif choice == "q" || choice == "Q" || choice == "quit" || choice == "exit"
         println("\n再见！")
     else

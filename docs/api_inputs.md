@@ -113,7 +113,78 @@
 }
 ```
 
-## 6. 健康检查
+## 6. 完整弹性评估 ★推荐★
+- **方法**：`POST /api/resilience-assessment`
+- **用途**：一键执行完整弹性评估流程，将台风场景生成(功能4)与完整流程(功能5)融合。
+
+**用户只需提供两个输入文件即可获得最终调度结果！**
+
+| 参数 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `tower_seg_file` | string/file | 是 | TowerSeg.xlsx - 配电网塔杆分段结构文件路径，或通过 form-data 上传。 |
+| `case_file` | string/file | 是 | ac_dc_real_case.xlsx - 混合交直流配电网算例文件路径，或通过 form-data 上传。 |
+| `output_dir` | string | 否 | 输出目录路径，默认为项目的 `data/` 目录。 |
+
+### 执行流程
+1. **Step 1**: 台风场景生成 → 生成 `mc_simulation_results_k100_clusters.xlsx`
+2. **Step 2**: 场景阶段分类 → 生成 `scenario_phase_classification.xlsx`
+3. **Step 3**: 滚动拓扑重构 → 生成 `topology_reconfiguration_results.xlsx`
+4. **Step 4**: MESS协同调度 → 生成 `mess_dispatch_results.xlsx` ← **最终输出**
+
+### 支持的调用方式
+
+**方式1: JSON Body 方式（指定文件路径）**
+```json
+{
+  "tower_seg_file": "D:/DistributionPowerFlow-runze/.../data/TowerSeg.xlsx",
+  "case_file": "D:/DistributionPowerFlow-runze/.../data/ac_dc_real_case.xlsx",
+  "output_dir": "D:/output"
+}
+```
+
+**方式2: Form-data 文件上传方式**
+```bash
+curl -X POST http://localhost:8000/api/resilience-assessment \
+  -F "tower_seg_file=@TowerSeg.xlsx" \
+  -F "case_file=@ac_dc_real_case.xlsx" \
+  -F "output_dir=D:/output"
+```
+
+### 返回结果
+```json
+{
+  "status": "success",
+  "message": "完整弹性评估流程已成功执行",
+  "input_files": {
+    "tower_seg_file": "D:/.../TowerSeg.xlsx",
+    "case_file": "D:/.../ac_dc_real_case.xlsx"
+  },
+  "output_files": {
+    "cluster_output": "D:/.../mc_simulation_results_k100_clusters.xlsx",
+    "phase_output": "D:/.../scenario_phase_classification.xlsx",
+    "topology_output": "D:/.../topology_reconfiguration_results.xlsx",
+    "dispatch_output": "D:/.../mess_dispatch_results.xlsx"
+  },
+  "execution_time": {
+    "step1_typhoon_generation": "120.50s",
+    "step2_phase_classification": "5.20s",
+    "step3_topology_reconfig": "30.15s",
+    "step4_mess_dispatch": "45.80s",
+    "total": "201.65s"
+  },
+  "final_result": "D:/.../mess_dispatch_results.xlsx"
+}
+```
+
+## 7. 聚类分析（仅台风场景生成）
+- **方法**：`POST /api/cluster-analysis`
+- **用途**：执行单独的聚类分析流程（仅功能4）。
+
+| 参数 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `file` | file | 是 | 通过 form-data 上传的 TowerSeg.xlsx 文件。 |
+
+## 8. 健康检查
 - **方法**：`GET /api/health`
 - **用途**：快速检查服务是否已经启动。返回 `{ "status": "ok" }`。
 
@@ -127,3 +198,25 @@ python api_server.py
 ```
 - 环境变量 `API_HOST`、`API_PORT`、`API_DEBUG` 控制监听参数。
 - 运行前需要确保本机已经正确配置 Julia 及其依赖包（Project.toml/Manifest.toml）。
+
+---
+
+## 快速入门：完整弹性评估
+
+如果你是第一次使用本系统，建议直接使用 **完整弹性评估 API** (`/api/resilience-assessment`)：
+
+1. 准备两个输入文件：
+   - `TowerSeg.xlsx` - 描述配电网的塔杆分段结构
+   - `ac_dc_real_case.xlsx` - 混合交直流配电网算例数据
+
+2. 调用 API：
+```bash
+curl -X POST http://localhost:8000/api/resilience-assessment \
+  -H "Content-Type: application/json" \
+  -d '{
+    "tower_seg_file": "D:/path/to/TowerSeg.xlsx",
+    "case_file": "D:/path/to/ac_dc_real_case.xlsx"
+  }'
+```
+
+3. 等待执行完成，获取 `mess_dispatch_results.xlsx` 作为最终的弹性评估调度结果。

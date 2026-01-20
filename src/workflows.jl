@@ -23,7 +23,8 @@ include(joinpath(@__DIR__, "rolling_horizon_reconfiguration.jl"))
 include(joinpath(@__DIR__, "dispatch_main.jl"))
 
 export run_classify_phases, run_rolling_reconfig, run_mess_dispatch,
-       run_typhoon_workflow, run_full_pipeline, show_menu, show_help
+       run_typhoon_workflow, run_full_pipeline, run_resilience_assessment,
+       show_menu, show_help
 
 function _read_user_input(prompt::String)
     print(prompt)
@@ -231,9 +232,10 @@ function show_menu()
     println("  3. 混合配电网+MESS协同调度")
     println("  4. 台风场景生成工作流")
     println("  5. 完整流程（1→2→3）")
+    println("  6. 完整弹性评估（4+5融合，一键执行）★推荐★")
     println("  q. 退出")
     println()
-    print("请输入选项 [1-5/q]: ")
+    print("请输入选项 [1-6/q]: ")
 end
 
 function run_full_pipeline()
@@ -255,6 +257,162 @@ function run_full_pipeline()
     println("="^60)
 end
 
+"""
+完整弹性评估流程 - 融合功能4和功能5
+
+用户只需提供两个文件：
+1. tower_seg_file: TowerSeg.xlsx - 配电网塔杆分段结构文件
+2. case_file: ac_dc_real_case.xlsx - 混合交直流配电网算例文件
+
+执行流程：
+Step 1: 台风场景生成 (功能4) - 生成 mc_simulation_results_k100_clusters.xlsx
+Step 2: 场景阶段分类 - 生成 scenario_phase_classification.xlsx
+Step 3: 滚动拓扑重构 - 生成 topology_reconfiguration_results.xlsx
+Step 4: MESS协同调度 - 生成 mess_dispatch_results.xlsx
+
+参数：
+- tower_seg_file: TowerSeg.xlsx 文件路径
+- case_file: ac_dc_real_case.xlsx 文件路径
+- output_dir: (可选) 输出目录路径，默认为 data/
+
+返回：
+- Dict 包含所有输出文件路径
+"""
+function run_resilience_assessment(;
+    tower_seg_file::Union{Nothing, String} = nothing,
+    case_file::Union{Nothing, String} = nothing,
+    output_dir::Union{Nothing, String} = nothing)
+    
+    println("\n" * "="^60)
+    println("完整弹性评估流程 (功能4 + 功能5)")
+    println("="^60)
+    
+    # 解析输入路径
+    default_tower = joinpath(ROOT_DIR, "data", "TowerSeg.xlsx")
+    default_case = joinpath(ROOT_DIR, "data", "ac_dc_real_case.xlsx")
+    default_output_dir = joinpath(ROOT_DIR, "data")
+    
+    selected_tower = _resolve_path_arg(tower_seg_file, "请输入TowerSeg Excel路径", default_tower)
+    selected_case = _resolve_path_arg(case_file, "请输入ac_dc_real_case Excel路径", default_case)
+    
+    selected_output_dir = if isnothing(output_dir) || isempty(String(output_dir))
+        println("→ 使用默认输出目录: $(default_output_dir)")
+        default_output_dir
+    else
+        normalized = _normalize_user_path(String(output_dir))
+        println("→ 使用输出目录: $(normalized)")
+        normalized
+    end
+    
+    # 确保输出目录存在
+    if !isdir(selected_output_dir)
+        mkpath(selected_output_dir)
+    end
+    
+    # 定义输出文件路径
+    cluster_output = joinpath(selected_output_dir, "mc_simulation_results_k100_clusters.xlsx")
+    phase_output = joinpath(selected_output_dir, "scenario_phase_classification.xlsx")
+    topology_output = joinpath(selected_output_dir, "topology_reconfiguration_results.xlsx")
+    dispatch_output = joinpath(selected_output_dir, "mess_dispatch_results.xlsx")
+    
+    println("\n输入文件:")
+    println("  - TowerSeg: $(selected_tower)")
+    println("  - Case: $(selected_case)")
+    println("\n输出文件:")
+    println("  - 聚类结果: $(cluster_output)")
+    println("  - 阶段分类: $(phase_output)")
+    println("  - 拓扑重构: $(topology_output)")
+    println("  - 调度结果: $(dispatch_output)")
+    
+    # ===========================================================
+    # Step 1: 台风场景生成 (功能4)
+    # ===========================================================
+    println("\n" * "-"^60)
+    println("[Step 1/4] 执行台风场景生成...")
+    println("-"^60)
+    
+    py"""
+    import sys
+    import os
+
+    project_root = $ROOT_DIR
+    os.chdir(project_root)
+    if project_root not in sys.path:
+        sys.path.insert(0, project_root)
+
+    from app import main
+    main(["one-click", "--tower-excel", $selected_tower, "--final-output", $cluster_output])
+    """
+    
+    if !isfile(cluster_output)
+        error("台风场景生成失败：聚类结果文件未生成")
+    end
+    println("✓ Step 1 完成: 聚类结果已生成")
+    
+    # ===========================================================
+    # Step 2: 场景阶段分类
+    # ===========================================================
+    println("\n" * "-"^60)
+    println("[Step 2/4] 执行场景阶段分类...")
+    println("-"^60)
+    
+    detail_df, summary_df = classify_phases(
+        input_path = cluster_output,
+        output_path = phase_output,
+    )
+    println("✓ Step 2 完成: 场景阶段分类已完成")
+    println("  详细表: $(nrow(detail_df)) 行")
+    println("  汇总表: $(nrow(summary_df)) 行")
+    
+    # ===========================================================
+    # Step 3: 滚动拓扑重构
+    # ===========================================================
+    println("\n" * "-"^60)
+    println("[Step 3/4] 执行滚动拓扑重构...")
+    println("-"^60)
+    
+    results_df = run_rolling_reconfiguration(
+        case_file = selected_case,
+        fault_file = cluster_output,
+        stage_file = phase_output,
+        output_file = topology_output,
+    )
+    println("✓ Step 3 完成: 滚动拓扑重构已完成")
+    
+    # ===========================================================
+    # Step 4: MESS协同调度
+    # ===========================================================
+    println("\n" * "-"^60)
+    println("[Step 4/4] 执行MESS协同调度...")
+    println("-"^60)
+    
+    run_mess_dispatch_julia(
+        case_path = selected_case,
+        topology_path = topology_output,
+        fallback_topology = cluster_output,
+        output_file = dispatch_output,
+    )
+    println("✓ Step 4 完成: MESS协同调度已完成")
+    
+    # ===========================================================
+    # 完成
+    # ===========================================================
+    println("\n" * "="^60)
+    println("✓ 完整弹性评估流程执行完毕")
+    println("="^60)
+    println("\n最终输出文件:")
+    println("  → $(dispatch_output)")
+    
+    return Dict(
+        "tower_seg_file" => selected_tower,
+        "case_file" => selected_case,
+        "cluster_output" => cluster_output,
+        "phase_output" => phase_output,
+        "topology_output" => topology_output,
+        "dispatch_output" => dispatch_output,
+    )
+end
+
 function show_help()
     println("""
 使用方法:
@@ -264,8 +422,21 @@ function show_help()
     julia main.jl --dispatch         # MESS协同调度
     julia main.jl --typhoon          # 台风场景生成（交互式）
     julia main.jl --typhoon typhoon  # 台风场景生成（指定子命令）
-    julia main.jl --full             # 完整流程
+    julia main.jl --full             # 完整流程（1→2→3）
+    julia main.jl --resilience       # 完整弹性评估（4+5融合）★推荐★
     julia main.jl --help             # 显示帮助
+
+完整弹性评估说明:
+    --resilience 选项将台风场景生成(功能4)和完整流程(功能5)融合为一键执行。
+    用户只需提供两个文件：
+    1. TowerSeg.xlsx - 配电网塔杆分段结构文件
+    2. ac_dc_real_case.xlsx - 混合交直流配电网算例文件
+    
+    执行后将自动生成：
+    - mc_simulation_results_k100_clusters.xlsx (聚类结果)
+    - scenario_phase_classification.xlsx (阶段分类)
+    - topology_reconfiguration_results.xlsx (拓扑重构)
+    - mess_dispatch_results.xlsx (调度结果) ← 最终输出
     """)
 end
 

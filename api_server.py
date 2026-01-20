@@ -368,6 +368,199 @@ def health_route():
     return jsonify({"status": "ok"})
 
 
+@app.route("/api/resilience-assessment", methods=["POST"])
+def resilience_assessment_route():
+    """
+    完整弹性评估流程API
+    
+    用户只需提供两个文件：
+    1. TowerSeg.xlsx - 配电网塔杆分段结构文件
+    2. ac_dc_real_case.xlsx - 混合交直流配电网算例文件
+    
+    执行流程：
+    Step 1: 台风场景生成 (功能4) - 生成 mc_simulation_results_k100_clusters.xlsx
+    Step 2: 场景阶段分类 - 生成 scenario_phase_classification.xlsx
+    Step 3: 滚动拓扑重构 - 生成 topology_reconfiguration_results.xlsx
+    Step 4: MESS协同调度 - 生成 mess_dispatch_results.xlsx
+    
+    输入参数 (JSON body 或 form-data):
+    - tower_seg_file: TowerSeg.xlsx文件路径或上传的文件
+    - case_file: ac_dc_real_case.xlsx文件路径或上传的文件
+    - output_dir: (可选) 输出目录路径
+    
+    返回：
+    - mess_dispatch_results.xlsx 的路径及各中间文件路径
+    """
+    try:
+        start_time = time.time()
+        
+        # 1. 处理输入文件
+        tower_seg_path = None
+        case_path = None
+        output_dir = None
+        
+        # 检查是否有文件上传
+        if 'tower_seg_file' in request.files and 'case_file' in request.files:
+            # 文件上传模式
+            tower_seg_file = request.files['tower_seg_file']
+            case_file = request.files['case_file']
+            
+            if tower_seg_file.filename == '' or case_file.filename == '':
+                return _error("文件名为空")
+            
+            # 保存上传的文件
+            tower_seg_path = TEMP_UPLOAD_DIR / f"upload_{uuid.uuid4().hex}_TowerSeg.xlsx"
+            case_path = TEMP_UPLOAD_DIR / f"upload_{uuid.uuid4().hex}_ac_dc_real_case.xlsx"
+            tower_seg_file.save(str(tower_seg_path))
+            case_file.save(str(case_path))
+            
+            # 获取可选的输出目录
+            output_dir = request.form.get('output_dir')
+        else:
+            # JSON参数模式
+            payload = _extract_payload()
+            tower_seg_path = _normalize_path(payload.get("tower_seg_file"))
+            case_path = _normalize_path(payload.get("case_file"))
+            output_dir = _normalize_path(payload.get("output_dir"))
+        
+        if not tower_seg_path or not case_path:
+            return _error("必须提供 tower_seg_file (TowerSeg.xlsx) 和 case_file (ac_dc_real_case.xlsx)")
+        
+        tower_seg_path = Path(tower_seg_path)
+        case_path = Path(case_path)
+        
+        if not tower_seg_path.exists():
+            return _error(f"TowerSeg文件不存在: {tower_seg_path}")
+        if not case_path.exists():
+            return _error(f"算例文件不存在: {case_path}")
+        
+        # 设置输出路径
+        if output_dir:
+            output_dir = Path(output_dir)
+        else:
+            output_dir = PROJECT_ROOT / "data"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        
+        cluster_output = output_dir / "mc_simulation_results_k100_clusters.xlsx"
+        phase_output = output_dir / "scenario_phase_classification.xlsx"
+        topology_output = output_dir / "topology_reconfiguration_results.xlsx"
+        dispatch_output = output_dir / "mess_dispatch_results.xlsx"
+        
+        print(f"[resilience-assessment] 开始完整弹性评估流程")
+        print(f"[resilience-assessment] TowerSeg: {tower_seg_path}")
+        print(f"[resilience-assessment] Case: {case_path}")
+        print(f"[resilience-assessment] 输出目录: {output_dir}")
+        
+        # ===========================================================
+        # Step 1: 台风场景生成 (功能4)
+        # ===========================================================
+        step1_start = time.time()
+        print(f"\n[Step 1/4] 执行台风场景生成...")
+        
+        original_cwd = os.getcwd()
+        try:
+            os.chdir(str(PROJECT_ROOT))
+            typhoon_cli.main([
+                "one-click",
+                "--tower-excel", str(tower_seg_path),
+                "--final-output", str(cluster_output)
+            ])
+        except SystemExit as exc:
+            if exc.code not in (None, 0):
+                raise RuntimeError(f"台风场景生成失败: {exc.code}") from exc
+        finally:
+            os.chdir(original_cwd)
+        
+        step1_time = time.time() - step1_start
+        print(f"[Step 1/4] 完成，耗时: {step1_time:.2f}秒")
+        
+        if not cluster_output.exists():
+            return _error("台风场景生成失败：聚类结果文件未生成")
+        
+        # ===========================================================
+        # Step 2-4: 执行 full-pipeline (功能5)
+        # ===========================================================
+        print(f"\n[Step 2/4] 执行场景阶段分类...")
+        step2_start = time.time()
+        _call_workflow(
+            "run_classify_phases",
+            {
+                "input_path": str(cluster_output),
+                "output_path": str(phase_output),
+            },
+        )
+        step2_time = time.time() - step2_start
+        print(f"[Step 2/4] 完成，耗时: {step2_time:.2f}秒")
+        
+        print(f"\n[Step 3/4] 执行滚动拓扑重构...")
+        step3_start = time.time()
+        _call_workflow(
+            "run_rolling_reconfig",
+            {
+                "case_file": str(case_path),
+                "fault_file": str(cluster_output),
+                "stage_file": str(phase_output),
+                "output_file": str(topology_output),
+            },
+        )
+        step3_time = time.time() - step3_start
+        print(f"[Step 3/4] 完成，耗时: {step3_time:.2f}秒")
+        
+        print(f"\n[Step 4/4] 执行MESS协同调度...")
+        step4_start = time.time()
+        _call_workflow(
+            "run_mess_dispatch",
+            {
+                "case_path": str(case_path),
+                "topology_path": str(topology_output),
+                "fallback_topology": str(cluster_output),
+                "output_file": str(dispatch_output),
+            },
+        )
+        step4_time = time.time() - step4_start
+        print(f"[Step 4/4] 完成，耗时: {step4_time:.2f}秒")
+        
+        total_time = time.time() - start_time
+        print(f"\n[resilience-assessment] 完整弹性评估流程完成，总耗时: {total_time:.2f}秒")
+        
+        # 检查最终输出文件
+        if not dispatch_output.exists():
+            return _error("MESS调度完成，但输出文件未生成")
+        
+        return jsonify({
+            "status": "success",
+            "message": "完整弹性评估流程已成功执行",
+            "input_files": {
+                "tower_seg_file": str(tower_seg_path),
+                "case_file": str(case_path),
+            },
+            "output_files": {
+                "cluster_output": str(cluster_output),
+                "phase_output": str(phase_output),
+                "topology_output": str(topology_output),
+                "dispatch_output": str(dispatch_output),
+            },
+            "execution_time": {
+                "step1_typhoon_generation": f"{step1_time:.2f}s",
+                "step2_phase_classification": f"{step2_time:.2f}s",
+                "step3_topology_reconfig": f"{step3_time:.2f}s",
+                "step4_mess_dispatch": f"{step4_time:.2f}s",
+                "total": f"{total_time:.2f}s",
+            },
+            "final_result": str(dispatch_output),
+        })
+        
+    except Exception as exc:
+        import traceback
+        error_detail = traceback.format_exc()
+        print(f"[resilience-assessment] 错误: {error_detail}")
+        return jsonify({
+            "status": "error",
+            "message": f"弹性评估流程执行失败: {str(exc)}",
+            "error_detail": error_detail,
+        }), 500
+
+
 if __name__ == "__main__":
     host = os.environ.get("API_HOST", "0.0.0.0")
     port = int(os.environ.get("API_PORT", "8000"))
