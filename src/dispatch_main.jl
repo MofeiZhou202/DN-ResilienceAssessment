@@ -18,7 +18,7 @@ const VariableRef = JuMP.VariableRef
 const DEFAULT_CASE_XLSX = joinpath(@__DIR__, "..", "data", "ac_dc_real_case.xlsx")
 const DEFAULT_TOPOLOGY_XLSX = joinpath(@__DIR__, "..", "data", "topology_reconfiguration_results.xlsx")
 const DEFAULT_MC_XLSX = joinpath(@__DIR__, "..", "data", "mc_simulation_results_k100_clusters.xlsx")
-const DEFAULT_DISPATCH_REPORT_XLSX = joinpath(@__DIR__, "..", "output", "mess_dispatch_report.xlsx")
+const DEFAULT_DISPATCH_REPORT_XLSX = joinpath(@__DIR__, "..", "data", "mess_dispatch_report.xlsx")
 const DEFAULT_HOURS = 48
 const TIME_STEP_HOURS = 1.0
 const MESS_TRAVEL_ENERGY_LOSS_PER_HOUR = 0.0
@@ -183,6 +183,7 @@ struct HybridGridCase
 end
 
 # 默认 MESS 配置 (单位: kW, kWh)
+# MESSConfig(name, 接入节点, 最大充电功率, 最大放电功率, 储能容量, 初始SOC, 充电效率%, 放电效率%)
 # 配电网级别：典型移动储能系统容量
 const DEFAULT_MESS = [
     MESSConfig("MESS-1", 5, 1500.0, 1500.0, 4500.0, 2500.0, 92.0, 90.0),   # 1500 kW, 4500 kWh
