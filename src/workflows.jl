@@ -4,6 +4,10 @@ using DataFrames
 using XLSX
 using PyCall
 using Dates
+using Random
+using Clustering
+using Distances
+using Statistics
 
 const ROOT_DIR = normpath(joinpath(@__DIR__, ".."))
 
