@@ -143,7 +143,12 @@ function run_mess_dispatch(;
 
     selected_case = _resolve_path_arg(case_path, "请输入混合配电网算例输入路径", default_case)
     selected_topology = _resolve_path_arg(topology_path, "请输入拓扑重构结果文件路径", default_topology)
-    selected_fallback = _resolve_path_arg(fallback_topology, "请输入拓扑缺失回退文件路径", default_fallback)
+    selected_fallback = if isnothing(fallback_topology) || isempty(String(fallback_topology))
+        println("→ 使用默认拓扑缺失回退文件: $(default_fallback)")
+        default_fallback
+    else
+        _resolve_path_arg(fallback_topology, "请输入拓扑缺失回退文件路径", default_fallback)
+    end
     selected_output = _resolve_path_arg(output_file, "请输入调度结果Excel输出路径", default_output)
 
     run_mess_dispatch_julia(
@@ -156,31 +161,15 @@ function run_mess_dispatch(;
     println("  输出文件: $(selected_output)")
 end
 
-function run_typhoon_workflow(; command::Union{Nothing, String} = nothing)
+function run_typhoon_workflow(; command::Union{Nothing, String} = nothing,
+    tower_excel::Union{Nothing, String} = nothing,
+    final_output::Union{Nothing, String} = nothing)
     println("\n" * "="^60)
     println("台风场景生成工作流")
     println("="^60)
 
-    selected_command = if isnothing(command)
-        strip(_read_user_input("如需传入台风工作流子命令（可包含自定义文件路径），请输入（直接回车进入交互菜单）: "))
-    else
-        String(command)
-    end
-
-    if isempty(selected_command)
-        py"""
-        import sys
-        import os
-
-        project_root = $ROOT_DIR
-        os.chdir(project_root)
-        if project_root not in sys.path:
-            sys.path.insert(0, project_root)
-
-        from app import main
-        main()
-        """
-    else
+    selected_command = isnothing(command) ? "" : strip(String(command))
+    if !isempty(selected_command)
         py"""
         import sys
         import os
@@ -193,7 +182,36 @@ function run_typhoon_workflow(; command::Union{Nothing, String} = nothing)
         from app import main
         main($selected_command.split())
         """
+        return
     end
+
+    default_tower = joinpath(ROOT_DIR, "data", "TowerSeg.xlsx")
+    selected_tower = _resolve_path_arg(tower_excel, "请输入TowerSeg Excel路径", default_tower)
+
+    default_output = joinpath(ROOT_DIR, "data", "mc_simulation_results_k100_clusters.xlsx")
+    selected_output = if isnothing(final_output) || isempty(String(final_output))
+        println("→ 使用默认聚类结果输出路径: $(default_output)")
+        default_output
+    else
+        normalized = _normalize_user_path(String(final_output))
+        println("→ 使用聚类结果输出路径: $(normalized)")
+        normalized
+    end
+
+    println("→ 正在执行一键台风评估流程，请稍候...")
+
+    py"""
+    import sys
+    import os
+
+    project_root = $ROOT_DIR
+    os.chdir(project_root)
+    if project_root not in sys.path:
+        sys.path.insert(0, project_root)
+
+    from app import main
+    main(["one-click", "--tower-excel", $selected_tower, "--final-output", $selected_output])
+    """
 end
 
 function show_menu()

@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import shutil
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -30,7 +31,7 @@ import pandas as pd
 import numpy as np
 
 from src.config import (
-    CLUSTER_RESULTS_DIR,
+    DATA_DIR,
     GENERATED_DATA_DIR,
     LEGACY_ORIGIN_LAT_LON,
     MC_RESULTS_DIR,
@@ -72,7 +73,7 @@ DEFAULT_NN_SAMPLE = {
     "InitTheta": 1.165574874,
     "InitTransSpeed": 5.400026797,
 }
-DEFAULT_CLUSTER_SAMPLE_ROWS = 32
+DEFAULT_CLUSTER_SAMPLE_ROWS = 35
 DEFAULT_CLUSTER_COUNT = 100
 DEFAULT_CLUSTER_COMPONENT_PREFIX = "Line_"
 DEFAULT_CLUSTER_COVERAGE_TARGETS = [10, 20, 50, 100, 200]
@@ -81,9 +82,55 @@ DEFAULT_NN_CHECKPOINT_DIR = ROOT_DIR / "checkpoints" / "init_models"
 DEFAULT_TY_DURATION = 48
 DEFAULT_TY_YEAR = 2025
 DEFAULT_NN_JITTER = 0.05
-SAMPLE_LINEFAIL_WORKBOOK = ROOT_DIR / "dataset" / "generated" / "impact" / "test_linefail.xlsx"
-SAMPLE_WIND_WORKBOOK = ROOT_DIR / "dataset" / "generated" / "impact" / "test_wind.xlsx"
-DEFAULT_CABLE_RAIN_OUTPUT = GENERATED_DATA_DIR / "impact" / "cable_rainfall.xlsx"
+
+WORKFLOW_DATA_DIR = DATA_DIR
+TYPHOON_OUTPUT_DIR = WORKFLOW_DATA_DIR / "typhoons"
+IMPACT_OUTPUT_DIR = WORKFLOW_DATA_DIR / "impact"
+MONTE_CARLO_OUTPUT_DIR = WORKFLOW_DATA_DIR / "monte_carlo"
+CLUSTER_OUTPUT_DIR = WORKFLOW_DATA_DIR / "cluster"
+AUTO_EVAL_ROOT = WORKFLOW_DATA_DIR / "auto_eval_runs"
+
+for directory in (
+    TYPHOON_OUTPUT_DIR,
+    IMPACT_OUTPUT_DIR,
+    MONTE_CARLO_OUTPUT_DIR,
+    CLUSTER_OUTPUT_DIR,
+    AUTO_EVAL_ROOT,
+):
+    directory.mkdir(parents=True, exist_ok=True)
+
+DEFAULT_SEASONAL_HURRICANE = WORKFLOW_DATA_DIR / "05_STY.xlsx"
+DEFAULT_NN_OUTPUT = TYPHOON_OUTPUT_DIR / "nn_generated.xlsx"
+DEFAULT_TOWERSEG_WORKBOOK = WORKFLOW_DATA_DIR / "TowerSeg.xlsx"
+DEFAULT_WIND_FARM_WORKBOOK = WORKFLOW_DATA_DIR / "wind_farms.xlsx"
+DEFAULT_LINEFAIL_WORKBOOK = IMPACT_OUTPUT_DIR / "linefailprob.xlsx"
+DEFAULT_WIND_OUTPUT_WORKBOOK = IMPACT_OUTPUT_DIR / "wind_farms_output.xlsx"
+DEFAULT_CABLE_RAIN_OUTPUT = IMPACT_OUTPUT_DIR / "cable_rainfall.xlsx"
+DEFAULT_RANDOM_FAILURE_WORKBOOK = WORKFLOW_DATA_DIR / "random_failure_prob.xlsx"
+DEFAULT_MC_WORKBOOK = MONTE_CARLO_OUTPUT_DIR / "mc_simulation_results.xlsx"
+DEFAULT_CLUSTER_WORKBOOK = MONTE_CARLO_OUTPUT_DIR / "mc_simulation_results.xlsx"
+DEFAULT_CLUSTER_OUTPUT_DIR = CLUSTER_OUTPUT_DIR
+DEFAULT_NN_DATA_ROOT = WORKFLOW_DATA_DIR / "classified_typhoons"
+FINAL_SCENARIO_WORKBOOK = WORKFLOW_DATA_DIR / "mc_simulation_results_k100_clusters.xlsx"
+
+LEGACY_HURRICANE_SOURCES = [
+    RAW_DATA_DIR / "hurricane.xlsx",
+    GENERATED_DATA_DIR / "typhoons" / "seasonal_hurricanes.xlsx",
+]
+LEGACY_TOWERSEG_SOURCES = [RAW_DATA_DIR / "TowerSeg.xlsx"]
+LEGACY_WIND_FARM_SOURCES = [RAW_DATA_DIR / "wind_farms.xlsx"]
+LEGACY_LINEFAIL_SOURCES = [GENERATED_DATA_DIR / "impact" / "linefailprob.xlsx"]
+LEGACY_WIND_OUTPUT_SOURCES = [GENERATED_DATA_DIR / "impact" / "wind_farms_output.xlsx"]
+LEGACY_MC_SOURCES = [
+    MC_RESULTS_DIR / "mc_simulation_results.xlsx",
+    ROOT_DIR / "new_dataset" / "MC_results" / "mc_simulation_results.xlsx",
+    ROOT_DIR.parent / "new_dataset" / "MC_results" / "mc_simulation_results.xlsx",
+]
+LEGACY_NN_DATA_ROOTS = [
+    ROOT_DIR / "dataset" / "classified_typhoons",
+    ROOT_DIR / "new_dataset" / "classified_typhoons",
+    ROOT_DIR.parent / "new_dataset" / "classified_typhoons",
+]
 
 
 def _first_existing_path(*paths: Path) -> Path:
@@ -93,18 +140,14 @@ def _first_existing_path(*paths: Path) -> Path:
     return paths[-1]
 
 
-DEFAULT_NN_DATA_ROOT = _first_existing_path(
-    ROOT_DIR / "dataset" / "classified_typhoons",
-    ROOT_DIR / "new_dataset" / "classified_typhoons",
-    ROOT_DIR.parent / "new_dataset" / "classified_typhoons",
+SAMPLE_LINEFAIL_WORKBOOK = _first_existing_path(
+    IMPACT_OUTPUT_DIR / "test_linefail.xlsx",
+    ROOT_DIR / "dataset" / "generated" / "impact" / "test_linefail.xlsx",
 )
-DEFAULT_CLUSTER_WORKBOOK = _first_existing_path(
-    MC_RESULTS_DIR / "mc_simulation_results.xlsx",
-    ROOT_DIR / "new_dataset" / "MC_results" / "mc_simulation_results.xlsx",
-    ROOT_DIR.parent / "new_dataset" / "MC_results" / "mc_simulation_results.xlsx",
+SAMPLE_WIND_WORKBOOK = _first_existing_path(
+    IMPACT_OUTPUT_DIR / "test_wind.xlsx",
+    ROOT_DIR / "dataset" / "generated" / "impact" / "test_wind.xlsx",
 )
-DEFAULT_CLUSTER_OUTPUT_DIR = CLUSTER_RESULTS_DIR
-AUTO_EVAL_ROOT = ROOT_DIR / "dataset" / "auto_eval_runs"
 
 
 def _prompt_yes_no(message: str, default: bool = True) -> bool:
@@ -279,6 +322,27 @@ def _resolve_path(path_like: str | Path) -> Path:
     return Path(path_like).expanduser().resolve()
 
 
+def _resolve_with_legacy(
+    requested: str | Path,
+    *,
+    default_value: Path,
+    tag: str,
+    legacy_candidates: Sequence[Path] | None = None,
+) -> Path:
+    primary = _resolve_path(requested)
+    if primary.exists():
+        return primary
+    default_path = _resolve_path(default_value)
+    if primary != default_path:
+        return primary
+    for candidate in legacy_candidates or []:
+        candidate_path = _resolve_path(candidate)
+        if candidate_path.exists():
+            print(f"[{tag}] Missing default '{primary}', fallback -> {candidate_path}")
+            return candidate_path
+    return primary
+
+
 def _resolve_workbook(
     path_like: str | Path,
     *,
@@ -342,6 +406,25 @@ def _normalize_months(months: Sequence[int]) -> list[int]:
         if month not in normalized:
             normalized.append(month)
     return normalized or list(DEFAULT_MONTHS)
+
+
+def _count_nonempty_sheets(workbook_path: Path) -> int:
+    workbook_path = _resolve_path(workbook_path)
+    if not workbook_path.exists():
+        raise FileNotFoundError(f"TowerSeg 工作簿不存在: {workbook_path}")
+    sheet_count = 0
+    with pd.ExcelFile(workbook_path) as workbook:
+        for sheet_name in workbook.sheet_names:
+            try:
+                preview = workbook.parse(sheet_name=sheet_name, nrows=1, header=None)
+            except ValueError:
+                continue
+            if preview.dropna(how="all").empty:
+                continue
+            sheet_count += 1
+    if sheet_count == 0:
+        raise ValueError(f"TowerSeg 工作簿 {workbook_path.name} 不包含有效线路数据")
+    return sheet_count
 
 
 
@@ -422,8 +505,20 @@ def run_typhoon_lifecycle(args: argparse.Namespace) -> None:
 
 
 def run_transmission_impacts(args: argparse.Namespace) -> None:
-    tower_seg, cable_ids, cable_segments = build_tower_and_cable_segments(args.tower_excel)
-    hurricane_sheets = _load_hurricane_sheets(args.hurricane_file, args.sheets)
+    tower_excel = _resolve_with_legacy(
+        args.tower_excel,
+        default_value=DEFAULT_TOWERSEG_WORKBOOK,
+        tag="impacts",
+        legacy_candidates=LEGACY_TOWERSEG_SOURCES,
+    )
+    tower_seg, cable_ids, cable_segments = build_tower_and_cable_segments(str(tower_excel))
+    hurricane_file = _resolve_with_legacy(
+        args.hurricane_file,
+        default_value=DEFAULT_SEASONAL_HURRICANE,
+        tag="impacts",
+        legacy_candidates=LEGACY_HURRICANE_SOURCES,
+    )
+    hurricane_sheets = _load_hurricane_sheets(hurricane_file, args.sheets)
     output_path = _resolve_path(args.output)
     _ensure_parent(output_path)
     reference_hurricane: np.ndarray | None = None
@@ -484,7 +579,12 @@ def run_transmission_impacts(args: argparse.Namespace) -> None:
 
 
 def run_wind_impacts(args: argparse.Namespace) -> None:
-    wind_excel = _resolve_path(args.wind_excel)
+    wind_excel = _resolve_with_legacy(
+        args.wind_excel,
+        default_value=DEFAULT_WIND_FARM_WORKBOOK,
+        tag="wind",
+        legacy_candidates=LEGACY_WIND_FARM_SOURCES,
+    )
     if not wind_excel.exists():
         raise FileNotFoundError(f"Wind farm workbook not found: {wind_excel}")
     wind_farm_location_df = pd.read_excel(
@@ -492,7 +592,13 @@ def run_wind_impacts(args: argparse.Namespace) -> None:
         sheet_name=args.location_sheet,
         header=None,
     )
-    hurricane_sheets = _load_hurricane_sheets(args.hurricane_file, args.sheets)
+    hurricane_file = _resolve_with_legacy(
+        args.hurricane_file,
+        default_value=DEFAULT_SEASONAL_HURRICANE,
+        tag="wind",
+        legacy_candidates=LEGACY_HURRICANE_SOURCES,
+    )
+    hurricane_sheets = _load_hurricane_sheets(hurricane_file, args.sheets)
     output_path = _resolve_path(args.output)
     _ensure_parent(output_path)
 
@@ -516,14 +622,26 @@ def run_wind_impacts(args: argparse.Namespace) -> None:
 
 
 def run_monte_carlo(args: argparse.Namespace) -> None:
-    linefail_path, linefail_used_fallback = _resolve_workbook(
+    preferred_linefail = _resolve_with_legacy(
         args.linefail,
+        default_value=DEFAULT_LINEFAIL_WORKBOOK,
+        tag="mc",
+        legacy_candidates=LEGACY_LINEFAIL_SOURCES,
+    )
+    linefail_path, linefail_used_fallback = _resolve_workbook(
+        preferred_linefail,
         description="line failure",
         fallback=SAMPLE_LINEFAIL_WORKBOOK,
     )
-    wind_source = args.wind
+    preferred_wind = _resolve_with_legacy(
+        args.wind,
+        default_value=DEFAULT_WIND_OUTPUT_WORKBOOK,
+        tag="mc",
+        legacy_candidates=LEGACY_WIND_OUTPUT_SOURCES,
+    )
+    wind_source = preferred_wind
     if linefail_used_fallback:
-        resolved_default_wind = _resolve_path(args.wind)
+        resolved_default_wind = preferred_wind
         if resolved_default_wind != SAMPLE_WIND_WORKBOOK:
             print(
                 f"[mc] Wind workbook '{resolved_default_wind}' paired with missing data, switched to sample '{SAMPLE_WIND_WORKBOOK}'"
@@ -534,7 +652,7 @@ def run_monte_carlo(args: argparse.Namespace) -> None:
         description="wind output",
         fallback=SAMPLE_WIND_WORKBOOK,
     )
-    random_path = _ensure_random_failure_workbook(args.random)
+    random_path = _ensure_random_failure_workbook(_resolve_path(args.random))
 
     sheet_names = resolve_mc_sheets(str(linefail_path), str(wind_path), args.sheet)
 
@@ -618,7 +736,12 @@ def run_nn_typhoon(args: argparse.Namespace) -> None:
     setattr(sys.modules.setdefault("__main__", sys.modules[__name__]), "Normalization", NNNormalization)
 
     checkpoint_dir = _resolve_path(args.checkpoint_dir)
-    data_root = _resolve_path(args.data_root)
+    data_root = _resolve_with_legacy(
+        args.data_root,
+        default_value=DEFAULT_NN_DATA_ROOT,
+        tag="nn-typhoon",
+        legacy_candidates=LEGACY_NN_DATA_ROOTS,
+    )
     output_path = _resolve_path(args.output)
     _ensure_parent(output_path)
 
@@ -695,7 +818,12 @@ def run_cluster_workflow(args: argparse.Namespace) -> List[Path]:
             "\u6267\u884c\u805a\u7c07\u9700\u8981\u9884\u5148 pip install sklearn-extra scipy matplotlib"
         ) from exc
 
-    workbook_input = _resolve_path(args.workbook)
+    workbook_input = _resolve_with_legacy(
+        args.workbook,
+        default_value=DEFAULT_CLUSTER_WORKBOOK,
+        tag="cluster",
+        legacy_candidates=LEGACY_MC_SOURCES,
+    )
     if not workbook_input.exists():
         raise FileNotFoundError(f"\u672a\u627e\u5230 MC \u7ed3\u679c Excel: {workbook_input}")
 
@@ -743,7 +871,7 @@ def run_cluster_workflow(args: argparse.Namespace) -> List[Path]:
         results.append(output_path)
     return results
 
-def run_auto_evaluation(args: argparse.Namespace) -> None:
+def run_auto_evaluation(args: argparse.Namespace) -> dict[str, object]:
     base_dir = _resolve_path(args.output_root or AUTO_EVAL_ROOT)
     run_dir, run_name = _prepare_run_directory(base_dir, args.run_name)
     print(f"[auto-eval] Output directory: {run_dir}")
@@ -781,6 +909,7 @@ def run_auto_evaluation(args: argparse.Namespace) -> None:
             "mc_tre": args.mc_tre,
             "cluster_sample_rows": args.cluster_sample_rows,
             "cluster_count": args.cluster_count,
+            "lines_per_scenario": int(args.cluster_sample_rows),
         },
         "steps": [],
     }
@@ -904,6 +1033,69 @@ def run_auto_evaluation(args: argparse.Namespace) -> None:
     _write_json(summary_path, summary)
     print(f"[auto-eval] Summary saved -> {summary_path}")
 
+    result_payload = {
+        "run_dir": str(run_dir),
+        "summary_path": str(summary_path),
+        "cluster_outputs": [str(path) for path in cluster_outputs],
+        "linefail_workbook": str(linefail_path),
+        "wind_workbook": str(wind_output_path),
+        "monte_carlo_workbook": str(mc_output_path),
+        "line_count": int(args.cluster_sample_rows),
+    }
+    return result_payload
+
+
+def run_one_click_pipeline(args: argparse.Namespace) -> None:
+    tower_excel = _resolve_with_legacy(
+        args.tower_excel,
+        default_value=DEFAULT_TOWERSEG_WORKBOOK,
+        tag="one-click",
+        legacy_candidates=LEGACY_TOWERSEG_SOURCES,
+    )
+    detected_lines = _count_nonempty_sheets(tower_excel)
+    print(f"[one-click] TowerSeg= {tower_excel} -> 检测到 {detected_lines} 条线路")
+
+    auto_args = argparse.Namespace(
+        run_name="one_click",
+        output_root=str(AUTO_EVAL_ROOT),
+        typhoon_source="seasonal",
+        months=list(DEFAULT_MONTHS),
+        storms=100,
+        typhoon_seed=None,
+        levels=["05_STY"],
+        nn_count=100,
+        nn_seed=None,
+        nn_jitter=DEFAULT_NN_JITTER,
+        nn_input_json=None,
+        nn_data_root=str(DEFAULT_NN_DATA_ROOT),
+        nn_checkpoint_dir=str(DEFAULT_NN_CHECKPOINT_DIR),
+        tower_excel=str(tower_excel),
+        cable_rain_output=None,
+        wind_excel=str(DEFAULT_WIND_FARM_WORKBOOK),
+        wind_location_sheet="wind_farm_location",
+        random_failure=str(DEFAULT_RANDOM_FAILURE_WORKBOOK),
+        mc_sheet="all",
+        mc_batch=20,
+        mc_repair=False,
+        mc_no_random=False,
+        mc_tre=24,
+        cluster_sample_rows=detected_lines,
+        cluster_count=DEFAULT_CLUSTER_COUNT,
+        cluster_component_prefix=DEFAULT_CLUSTER_COMPONENT_PREFIX,
+        cluster_coverage_targets=list(DEFAULT_CLUSTER_COVERAGE_TARGETS),
+        cluster_coverage_thresholds=list(DEFAULT_CLUSTER_COVERAGE_THRESHOLDS),
+    )
+
+    result = run_auto_evaluation(auto_args)
+    cluster_outputs = result.get("cluster_outputs") or []
+    if not cluster_outputs:
+        raise RuntimeError("one-click 工作流未生成聚类结果")
+    latest_cluster = _resolve_path(cluster_outputs[0])
+    final_output = _resolve_path(getattr(args, "final_output", FINAL_SCENARIO_WORKBOOK))
+    _ensure_parent(final_output)
+    shutil.copy2(latest_cluster, final_output)
+    print(f"[one-click] 聚类结果已复制 -> {final_output}")
+
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Typhoon simulation control center")
@@ -920,7 +1112,7 @@ def build_parser() -> argparse.ArgumentParser:
     typhoon.add_argument("--seed", type=int, help="Optional RNG seed for reproducibility")
     typhoon.add_argument(
         "--output",
-        default=str(GENERATED_DATA_DIR / "typhoons" / "seasonal_hurricanes.xlsx"),
+        default=str(DEFAULT_SEASONAL_HURRICANE),
     )
     typhoon.set_defaults(func=run_typhoon_lifecycle)
 
@@ -930,15 +1122,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     impacts.add_argument(
         "--hurricane-file",
-        default=str(RAW_DATA_DIR / "hurricane.xlsx"),
+        default=str(DEFAULT_SEASONAL_HURRICANE),
     )
     impacts.add_argument(
         "--tower-excel",
-        default=str(RAW_DATA_DIR / "TowerSeg.xlsx"),
+        default=str(DEFAULT_TOWERSEG_WORKBOOK),
     )
     impacts.add_argument(
         "--output",
-        default=str(GENERATED_DATA_DIR / "impact" / "linefailprob.xlsx"),
+        default=str(DEFAULT_LINEFAIL_WORKBOOK),
     )
     impacts.add_argument(
         "--cable-rain-output",
@@ -958,16 +1150,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     wind.add_argument(
         "--hurricane-file",
-        default=str(RAW_DATA_DIR / "hurricane.xlsx"),
+        default=str(DEFAULT_SEASONAL_HURRICANE),
     )
     wind.add_argument(
         "--wind-excel",
-        default=str(RAW_DATA_DIR / "wind_farms.xlsx"),
+        default=str(DEFAULT_WIND_FARM_WORKBOOK),
     )
     wind.add_argument("--location-sheet", default="wind_farm_location")
     wind.add_argument(
         "--output",
-        default=str(GENERATED_DATA_DIR / "impact" / "wind_farms_output.xlsx"),
+        default=str(DEFAULT_WIND_OUTPUT_WORKBOOK),
     )
     wind.add_argument(
         "--sheets",
@@ -979,24 +1171,24 @@ def build_parser() -> argparse.ArgumentParser:
     mc = subparsers.add_parser("monte-carlo", help="Run pseudo Monte Carlo sampling")
     mc.add_argument(
         "--linefail",
-        default=str(GENERATED_DATA_DIR / "impact" / "linefailprob.xlsx"),
+        default=str(DEFAULT_LINEFAIL_WORKBOOK),
     )
     mc.add_argument(
         "--random",
-        default=str(RAW_DATA_DIR / "random_failure_prob.xlsx"),
+        default=str(DEFAULT_RANDOM_FAILURE_WORKBOOK),
     )
     mc.add_argument(
         "--wind",
-        default=str(GENERATED_DATA_DIR / "impact" / "wind_farms_output.xlsx"),
+        default=str(DEFAULT_WIND_OUTPUT_WORKBOOK),
     )
     mc.add_argument("--sheet", default="all", help="Sheet selection (all or comma list)")
-    mc.add_argument("--batch", type=int, default=1000)
+    mc.add_argument("--batch", type=int, default=20)
     mc.add_argument("--repair", action="store_true", help="Enable repair logic")
     mc.add_argument("--tre", type=int, default=24, help="Repair window length (hours)")
     mc.add_argument("--no-random", action="store_true", help="Disable base random failures")
     mc.add_argument(
         "--output",
-        default=str(MC_RESULTS_DIR / "mc_simulation_results.xlsx"),
+        default=str(DEFAULT_MC_WORKBOOK),
     )
     mc.add_argument(
         "--cable-rain-output",
@@ -1048,7 +1240,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     nn_typhoon.add_argument(
         "--output",
-        default=str(GENERATED_DATA_DIR / "typhoons" / "nn_generated.xlsx"),
+        default=str(DEFAULT_NN_OUTPUT),
         help="Output Excel path",
     )
     nn_typhoon.set_defaults(func=run_nn_typhoon)
@@ -1118,7 +1310,7 @@ def build_parser() -> argparse.ArgumentParser:
     auto.add_argument(
         "--output-root",
         default=str(AUTO_EVAL_ROOT),
-        help="Directory under dataset/ where run folders will live",
+        help="Directory under data/ where run folders will live",
     )
     auto.add_argument(
         "--typhoon-source",
@@ -1172,7 +1364,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     auto.add_argument(
         "--tower-excel",
-        default=str(RAW_DATA_DIR / "TowerSeg.xlsx"),
+        default=str(DEFAULT_TOWERSEG_WORKBOOK),
         help="Tower/segment workbook for transmission impacts",
     )
     auto.add_argument(
@@ -1181,7 +1373,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     auto.add_argument(
         "--wind-excel",
-        default=str(RAW_DATA_DIR / "wind_farms.xlsx"),
+        default=str(DEFAULT_WIND_FARM_WORKBOOK),
         help="Wind farm workbook for wind outputs",
     )
     auto.add_argument(
@@ -1191,7 +1383,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     auto.add_argument(
         "--random-failure",
-        default=str(RAW_DATA_DIR / "random_failure_prob.xlsx"),
+        default=str(DEFAULT_RANDOM_FAILURE_WORKBOOK),
         help="Random failure workbook consumed by Monte Carlo",
     )
     auto.add_argument(
@@ -1199,7 +1391,7 @@ def build_parser() -> argparse.ArgumentParser:
         default="all",
         help="Sheet selection for Monte Carlo stage",
     )
-    auto.add_argument("--mc-batch", type=int, default=1000, help="Samples per MC batch")
+    auto.add_argument("--mc-batch", type=int, default=20, help="Samples per MC batch")
     auto.add_argument("--mc-repair", action="store_true", help="Enable repair logic during MC")
     auto.add_argument("--mc-no-random", action="store_true", help="Disable base random failures")
     auto.add_argument(
@@ -1240,6 +1432,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="Normalized Hamming distance thresholds",
     )
     auto.set_defaults(func=run_auto_evaluation)
+
+    one_click = subparsers.add_parser(
+        "one-click",
+        help="仅需TowerSeg文件的一键全流程评估",
+    )
+    one_click.add_argument(
+        "--tower-excel",
+        default=str(DEFAULT_TOWERSEG_WORKBOOK),
+        help="配电网TowerSeg结构文件路径",
+    )
+    one_click.add_argument(
+        "--final-output",
+        default=str(FINAL_SCENARIO_WORKBOOK),
+        help="聚类后场景结果输出路径",
+    )
+    one_click.set_defaults(func=run_one_click_pipeline)
 
     return parser
 
@@ -1498,6 +1706,17 @@ def _collect_auto_eval_args(defaults: argparse.Namespace) -> List[str]:
     return tokens
 
 
+def _collect_one_click_args(defaults: argparse.Namespace) -> List[str]:
+    tokens: List[str] = []
+    tower = _prompt_text("TowerSeg Excel 路径", defaults.tower_excel)
+    if tower:
+        tokens += ["--tower-excel", tower]
+    final_output = _prompt_text("聚类结果输出路径", getattr(defaults, "final_output", None))
+    if final_output:
+        tokens += ["--final-output", final_output]
+    return tokens
+
+
 INTERACTIVE_BUILDERS = {
     "typhoon": _collect_typhoon_args,
     "impacts": _collect_impacts_args,
@@ -1506,6 +1725,7 @@ INTERACTIVE_BUILDERS = {
     "nn-typhoon": _collect_nn_typhoon_args,
     "cluster": _collect_cluster_args,
     "auto-eval": _collect_auto_eval_args,
+    "one-click": _collect_one_click_args,
 }
 
 
@@ -1518,6 +1738,7 @@ def _interactive_menu(parser: argparse.ArgumentParser) -> None:
         ("Pseudo Monte Carlo", "monte-carlo"),
         ("MC result clustering", "cluster"),
         ("Auto evaluation pipeline", "auto-eval"),
+        ("一键全流程评估", "one-click"),
     ]
     print("\nAvailable workflows:")
     for idx, (label, _) in enumerate(options, start=1):

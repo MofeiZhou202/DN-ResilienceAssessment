@@ -1,9 +1,11 @@
 """Cluster binary Monte Carlo simulation samples by typhoon intensity level.
 
-This script traverses the Excel workbooks stored under ``new_dataset/MC_results``.
-Each workbook contains multiple worksheets, and every worksheet is structured as
-640 rows by 48 columns of 0/1 data. Every consecutive block of 32 rows
-represents one simulation sample (i.e., a single power line outage scenario).
+This script traverses the Excel workbooks stored under the Monte Carlo results
+directory. Each workbook contains multiple worksheets of binary outage data
+with 48 columns (time steps). Every consecutive block of ``DEFAULT_SAMPLE_ROWS``
+rows represents one simulation sample (i.e., a single power-line outage
+scenario). The latest datasets ship with 35 monitored lines per scenario,
+therefore the default sample height is now 35 rows.
 
 For every workbook (corresponding to one typhoon intensity level), this script
 collects all samples across all worksheets, performs k-means clustering, and
@@ -50,7 +52,7 @@ except ImportError:  # pragma: no cover - optional dependency
     _scipy_stats = None
 
 # Default values that reflect the data layout described by the user.
-DEFAULT_SAMPLE_ROWS = 32
+DEFAULT_SAMPLE_ROWS = 35
 DEFAULT_CLUSTER_COUNT = 100
 DEFAULT_COMPONENT_PREFIX = "Line_"
 TARGET_COLUMNS = 48

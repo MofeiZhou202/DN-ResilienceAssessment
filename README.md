@@ -134,6 +134,21 @@ run_full_pipeline()             # 完整流程
 - 伪蒙特卡洛采样
 - 聚类分析
 
+#### 一键台风全流程
+- 仅需提供 `data/TowerSeg.xlsx` 配电网结构文件
+- 自动识别 TowerSeg 中的工作表数量并作为线路数
+- 自动串联季节性台风→线路影响→风电输出→伪 MC→聚类
+- 最终聚类场景写入 `data/mc_simulation_results_k100_clusters.xlsx`
+
+运行方式：
+
+```bash
+# 直接调用 Python 工作流
+python app.py one-click --tower-excel data/TowerSeg.xlsx
+
+# 或在 Julia 菜单中选择“台风场景生成工作流”，再选择“一键全流程评估”
+```
+
 ## 许可证
 
 MIT License
