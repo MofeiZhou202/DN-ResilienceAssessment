@@ -103,7 +103,12 @@ def _call_workflow(func_name: str, arguments: Dict[str, Any]) -> Any:
     workflows = runtime.workflows
     func = getattr(workflows, func_name)
     kwargs = {key: value for key, value in arguments.items() if value is not None}
-    return func(**kwargs)
+    try:
+        return func(**kwargs)
+    except SystemExit as exc:  # noqa: PERF203 -- 防止工作流意外退出服务器
+        if exc.code not in (None, 0):
+            raise RuntimeError(f"工作流 {func_name} 提前退出: {exc.code}") from exc
+        return None
 
 
 def _success(message: str, **data: Any):
@@ -231,7 +236,11 @@ def typhoon_workflow_route():
         command = _parse_command(payload.get("command"))
         if not command:
             raise ValueError("command 字段不能为空")
-        typhoon_cli.main(command)
+        try:
+            typhoon_cli.main(command)
+        except SystemExit as exc:  # 捕获 argparse 内部的 sys.exit
+            if exc.code not in (None, 0):
+                raise RuntimeError(f"台风工作流提前退出: {exc.code}") from exc
         return _success("台风工作流已执行", command=command)
     except Exception as exc:  # pylint: disable=broad-except
         return _error(str(exc))
@@ -246,4 +255,4 @@ if __name__ == "__main__":
     host = os.environ.get("API_HOST", "0.0.0.0")
     port = int(os.environ.get("API_PORT", "8000"))
     debug = os.environ.get("API_DEBUG", "false").lower() in {"1", "true", "yes"}
-    app.run(host=host, port=port, debug=debug, threaded=False, use_reloader=False)
+    app.run(host=host, port=port, debug=debug, threaded=True, use_reloader=False)
