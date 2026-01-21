@@ -676,17 +676,25 @@ def dn_resilience_route():
         step2_start = time.time()
         print(f"\n[Step 2/4] 执行场景阶段分类...")
         sys.stdout.flush()
-        
-        _call_workflow(
-            "run_classify_phases",
-            {
-                "input_path": str(cluster_output),
-                "output_path": str(phase_output),
-            },
-        )
+
+        # 为 Julia 脚本准备统一格式的路径，避免反斜杠解析问题
+        cluster_output_escaped = str(cluster_output).replace("\\", "/")
+        phase_output_escaped = str(phase_output).replace("\\", "/")
+
+        _call_julia_subprocess(f'''
+run_classify_phases(
+    input_path = "{cluster_output_escaped}",
+    output_path = "{phase_output_escaped}"
+)
+        ''')
         step2_time = time.time() - step2_start
         print(f"[Step 2/4] ✓ 完成，耗时: {step2_time:.2f}秒")
         sys.stdout.flush()
+        
+        # 统一保留这些转义后的路径供后续步骤复用
+        case_path_escaped = str(case_path).replace("\\", "/")
+        topology_output_escaped = str(topology_output).replace("\\", "/")
+        dispatch_output_escaped = str(dispatch_output).replace("\\", "/")
         
         # ===========================================================
         # Step 3: 滚动拓扑重构
@@ -695,13 +703,6 @@ def dn_resilience_route():
         step3_start = time.time()
         print(f"\n[Step 3/4] 执行滚动拓扑重构...")
         sys.stdout.flush()
-        
-        # 转义路径中的反斜杠
-        case_path_escaped = str(case_path).replace("\\", "/")
-        cluster_output_escaped = str(cluster_output).replace("\\", "/")
-        phase_output_escaped = str(phase_output).replace("\\", "/")
-        topology_output_escaped = str(topology_output).replace("\\", "/")
-        dispatch_output_escaped = str(dispatch_output).replace("\\", "/")
         
         # 使用子进程执行Julia，完全绕过PyJulia的卡死问题
         _call_julia_subprocess(f'''
