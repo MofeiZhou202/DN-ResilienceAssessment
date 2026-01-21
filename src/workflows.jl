@@ -24,7 +24,9 @@ include(joinpath(@__DIR__, "dispatch_main.jl"))
 
 export run_classify_phases, run_rolling_reconfig, run_mess_dispatch,
        run_typhoon_workflow, run_full_pipeline, run_resilience_assessment,
-       show_menu, show_help
+       show_menu, show_help,
+       # 底层函数导出，供API直接调用
+       run_rolling_reconfiguration, run_mess_dispatch_julia
 
 function _read_user_input(prompt::String)
     print(prompt)
@@ -36,6 +38,12 @@ function _read_user_input(prompt::String)
     end
 end
 
+# 检测是否在交互模式（有终端可以输入）
+function _is_interactive_mode()
+    # 如果 stdin 不是终端（如通过 API 调用），则不是交互模式
+    return isinteractive() && isa(stdin, Base.TTY)
+end
+
 function _normalize_user_path(path::String)
     if isempty(path)
         return path
@@ -45,6 +53,11 @@ function _normalize_user_path(path::String)
 end
 
 function _resolve_path_from_user(label::String, default_value::String)
+    # 非交互模式下直接使用默认值，避免阻塞
+    if !_is_interactive_mode()
+        println("→ 使用默认路径: $default_value")
+        return default_value
+    end
     prompt = isempty(default_value) ? string(label, ": ") : string(label, "（默认: ", default_value, "）: ")
     response = strip(_read_user_input(prompt))
     if isempty(response)

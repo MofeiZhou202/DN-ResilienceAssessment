@@ -30,6 +30,9 @@ DN-ResilienceAssessment/
 
 ## 安装依赖
 
+> 本项目目前在 Python 3.11 上验证通过，建议在开始前安装官方 Python 3.11 解释器并用 `py -3.11` 或 `C:\\Python311\\python.exe` 来运行各个脚本。
+> 如果系统中已有其他版本，可使用 Python Launcher 的 `py -3.11 -m pip install -r requirements.txt` 或创建 3.11 虚拟环境再执行安装。
+
 ### 1. Python依赖
 ```bash
 pip install -r requirements.txt

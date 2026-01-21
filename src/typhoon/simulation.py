@@ -1,5 +1,5 @@
 import numpy as np
-from math import exp, radians, log
+from math import exp, radians
 
 import pandas as pd
 from scipy.io import loadmat, savemat
@@ -273,7 +273,7 @@ def hurricane_simulation(initialcondition, month, duration=24):
             p_da = 1013 - (RH * e_s)
             A = epsilon * L_v * e_s / ((1 - epsilon) * R_v * Ts * p_da)
             B = RH * (1 + e_s * np.log(RH) / (p_da * A))
-            s = fsolve(lambda x: -A * (1 / x - B) - log(x), 1.0)[0]
+            s = fsolve(lambda x: -A * (1 / x - B) - np.log(x), 1.0)[0]
             DeltaP[i] = -((1 - RH) * e_s + Relativeintensity[i] * (s - 1) * (1013 - RH * e_s))
 
         # 更新其他参数

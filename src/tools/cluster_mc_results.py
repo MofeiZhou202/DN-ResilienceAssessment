@@ -41,10 +41,7 @@ import numpy as np
 import pandas as pd
 from sklearn_extra.cluster import KMedoids
 
-try:
-    from matplotlib import pyplot as plt  # type: ignore[import]
-except ImportError:  # pragma: no cover - optional dependency
-    plt = None  # type: ignore
+plt: Optional[ModuleType] = None
 
 try:
     from scipy import stats as _scipy_stats

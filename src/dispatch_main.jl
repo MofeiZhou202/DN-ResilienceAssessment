@@ -186,9 +186,9 @@ end
 # MESSConfig(name, 接入节点, 最大充电功率, 最大放电功率, 储能容量, 初始SOC, 充电效率%, 放电效率%)
 # 配电网级别：典型移动储能系统容量
 const DEFAULT_MESS = [
-    MESSConfig("MESS-1", 5, 1500.0, 1500.0, 4500.0, 3000.0, 92.0, 90.0),   # 1500 kW, 4500 kWh
-    MESSConfig("MESS-2", 10, 1000.0, 1000.0, 4000.0, 2000.0, 92.0, 90.0),  # 1000 kW, 4000 kWh
-    MESSConfig("MESS-3", 30, 500.0, 500.0, 3500.0, 1500.0, 92.0, 90.0),    # 500 kW, 3500 kWh
+    MESSConfig("MESS-1", 5, 1500.0, 1500.0, 4500.0, 0.0, 92.0, 90.0),   # 1500 kW, 4500 kWh
+    MESSConfig("MESS-2", 10, 1000.0, 1000.0, 4000.0, 0.0, 92.0, 90.0),  # 1000 kW, 4000 kWh
+    MESSConfig("MESS-3", 30, 500.0, 500.0, 3500.0, 0.0, 92.0, 90.0),    # 500 kW, 3500 kWh
 ]
 
 _normalize_label(value) = strip(string(value))

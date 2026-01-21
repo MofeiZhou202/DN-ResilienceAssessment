@@ -24,16 +24,24 @@ using Pkg
 const PROJECT_DIR = @__DIR__
 Pkg.activate(PROJECT_DIR)
 
-# 检查并安装PyCall
+# 指定 Python 3.11 可执行文件（优先使用仓库的 .venv）
+const PYTHON_BIN = begin
+    venv_python = joinpath(PROJECT_DIR, ".venv", "Scripts", "python.exe")
+    if isfile(venv_python)
+        venv_python
+    else
+        "C:/Python311/python.exe"
+    end
+end
+ENV["PYTHON"] = PYTHON_BIN
+
+# 检查并安装PyCall（使用上面指定的 Python）
 if !haskey(Pkg.project().dependencies, "PyCall")
     println("正在安装 PyCall...")
     Pkg.add("PyCall")
 end
 
 using PyCall
-
-# 设置Python路径（使用系统Python）
-ENV["PYTHON"] = ""  # 使用默认Python
 
 # 导入Python的sys模块来添加路径
 py"""
