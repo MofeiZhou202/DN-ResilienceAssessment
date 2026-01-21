@@ -6,6 +6,7 @@ using JuMP
 using Gurobi
 using Printf
 using Dates
+using JSON
 using Base.Filesystem: basename
 
 # 注意：utils 文件已在 workflows.jl 中统一加载，这里不再重复加载
@@ -1355,7 +1356,48 @@ function run_mess_dispatch_julia(; case_path::AbstractString=DEFAULT_CASE_XLSX,
     _export_mess_report(output_file, result, node_violation_prob, node_violation_breakdown)
     println("调度结果已导出到 $(output_file)")
 
-    return model, result
+    # 返回关键指标供API使用
+    key_metrics = Dict{String, Any}(
+        "expected_load_shed_total" => Float64(result["expected_load_shed_total"]),
+        "expected_supply_ratio" => Float64(result["expected_supply_ratio"]),
+        "objective_value" => Float64(result["objective"]),
+        "violations" => Dict{String, Any}[]
+    )
+
+    # 添加超标节点信息
+    for node_id in sort(collect(keys(node_violation_prob)))
+        stats = node_violation_breakdown[node_id]
+        longest = maximum(keys(stats))
+        total_prob = node_violation_prob[node_id]
+        push!(key_metrics["violations"], Dict{String, Any}(
+            "node_id" => Int(node_id),
+            "max_consecutive_hours" => Int(longest),
+            "violation_probability" => Float64(total_prob)
+        ))
+    end
+
+    # 将key_metrics写入临时JSON文件供Python读取（避免PyJulia内存问题）
+    key_metrics_file = replace(output_file, ".xlsx" => "_key_metrics.json")
+    
+    # 调试输出
+    println("\n[DEBUG] 准备写入key_metrics到: $(key_metrics_file)")
+    println("[DEBUG] expected_load_shed_total: $(key_metrics["expected_load_shed_total"])")
+    println("[DEBUG] expected_supply_ratio: $(key_metrics["expected_supply_ratio"])")
+    println("[DEBUG] objective_value: $(key_metrics["objective_value"])")
+    println("[DEBUG] violations count: $(length(key_metrics["violations"]))")
+    
+    # 写入JSON文件
+    try
+        key_metrics_json = JSON.json(key_metrics)
+        open(key_metrics_file, "w") do f
+            write(f, key_metrics_json)
+        end
+        println("[DEBUG] key_metrics已成功写入 $(key_metrics_file)")
+    catch e
+        println("[ERROR] 写入key_metrics失败: $(e)")
+    end
+
+    return model, result, key_metrics
 end
 
 function main()

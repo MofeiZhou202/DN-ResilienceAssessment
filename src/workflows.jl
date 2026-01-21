@@ -170,7 +170,8 @@ function run_mess_dispatch(;
     end
     selected_output = _resolve_path_arg(output_file, "请输入调度结果Excel输出路径", default_output)
 
-    run_mess_dispatch_julia(
+    # 调用 run_mess_dispatch_julia 并接收返回值（忽略额外返回值以保持兼容性）
+    model, result, key_metrics = run_mess_dispatch_julia(
         case_path = selected_case,
         topology_path = selected_topology,
         fallback_topology = selected_fallback,
@@ -178,6 +179,7 @@ function run_mess_dispatch(;
     )
     println("✓ MESS协同调度完成")
     println("  输出文件: $(selected_output)")
+
 end
 
 function run_typhoon_workflow(; command::Union{Nothing, String} = nothing,
@@ -399,7 +401,8 @@ function run_resilience_assessment(;
     println("[Step 4/4] 执行MESS协同调度...")
     println("-"^60)
     
-    run_mess_dispatch_julia(
+    # 调用 run_mess_dispatch_julia 并接收返回值（忽略额外返回值以保持兼容性）
+    model, result, key_metrics = run_mess_dispatch_julia(
         case_path = selected_case,
         topology_path = topology_output,
         fallback_topology = cluster_output,

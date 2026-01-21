@@ -1,7 +1,12 @@
 """Flask API 封装，用于在 Coze 等平台以 HTTP 方式触发现有工作流。"""
 from __future__ import annotations
 
+# 禁用Tkinter，避免与Julia GC冲突导致内存访问违规
 import os
+os.environ['MPLBACKEND'] = 'Agg'
+import matplotlib
+matplotlib.use('Agg')
+
 import shlex
 import re
 import sys
@@ -69,6 +74,49 @@ class WorkflowRuntime:
 runtime = WorkflowRuntime()
 JULIA_LOCK = threading.Lock()
 
+# ==================== 任务状态管理（异步模式）====================
+TASK_STATUS = {}  # task_id -> {"status": "pending"|"running"|"completed"|"failed", "result": {...}, "error": "...}
+TASK_LOCK = threading.Lock()
+
+def _create_task(task_type: str, **metadata) -> str:
+    """创建新任务并返回任务ID"""
+    task_id = f"{task_type}_{time.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
+    with TASK_LOCK:
+        TASK_STATUS[task_id] = {
+            "status": "pending",
+            "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "started_at": None,
+            "completed_at": None,
+            "task_type": task_type,
+            "metadata": metadata,
+            "result": None,
+            "error": None
+        }
+    return task_id
+
+def _update_task_status(task_id: str, status: str, **kwargs):
+    """更新任务状态"""
+    with TASK_LOCK:
+        if task_id in TASK_STATUS:
+            TASK_STATUS[task_id]["status"] = status
+            if kwargs:
+                TASK_STATUS[task_id].update(kwargs)
+            if status == "running" and TASK_STATUS[task_id]["started_at"] is None:
+                TASK_STATUS[task_id]["started_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+            elif status in ("completed", "failed"):
+                TASK_STATUS[task_id]["completed_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+
+def _run_task_in_background(task_id: str, func, *args, **kwargs):
+    """在后台线程中执行任务"""
+    try:
+        _update_task_status(task_id, "running")
+        result = func(*args, **kwargs)
+        _update_task_status(task_id, "completed", result=result)
+    except Exception as e:
+        import traceback
+        error_detail = traceback.format_exc()
+        _update_task_status(task_id, "failed", error=str(e), error_detail=error_detail)
+# ====================================================================
 
 def _normalize_path(value: Optional[str]) -> Optional[str]:
     if value is None:
@@ -515,16 +563,213 @@ def health_route():
     return jsonify({"status": "ok"})
 
 
+# ==================== DN-RESILIENCE 核心执行函数 ====================
+def _execute_dn_resilience(tower_seg_path, case_path, output_dir=None):
+    """
+    执行DN-RESILIENCE配电网弹性评估流程的核心逻辑
+    
+    返回:
+        dict: 执行结果，包含输出文件路径和各阶段耗时
+    """
+    start_time = time.time()
+    
+    tower_seg_path = Path(tower_seg_path)
+    case_path = Path(case_path)
+    
+    # 设置输出目录
+    if output_dir:
+        output_dir = Path(output_dir)
+    else:
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        output_dir = PROJECT_ROOT / "data" / "auto_eval_runs" / f"dn_resilience_{timestamp}"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    # 定义输出文件路径
+    cluster_output = output_dir / "mc_simulation_results_k100_clusters.xlsx"
+    phase_output = output_dir / "scenario_phase_classification.xlsx"
+    topology_output = output_dir / "topology_reconfiguration_results.xlsx"
+    dispatch_output = output_dir / "mess_dispatch_results.xlsx"
+    
+    print(f"\n{'='*60}")
+    print(f"[DN-RESILIENCE] 开始配电网弹性评估流程")
+    print(f"{'='*60}")
+    print(f"[DN-RESILIENCE] TowerSeg文件: {tower_seg_path}")
+    print(f"[DN-RESILIENCE] 算例文件: {case_path}")
+    print(f"[DN-RESILIENCE] 输出目录: {output_dir}")
+    sys.stdout.flush()
+    
+    # 预初始化Julia运行时
+    print(f"\n[DN-RESILIENCE] 预初始化Julia运行时...")
+    with JULIA_LOCK:
+        runtime.ensure()
+    print(f"[DN-RESILIENCE] Julia运行时初始化完成")
+    sys.stdout.flush()
+    
+    # Step 1: 台风场景生成
+    step1_start = time.time()
+    print(f"\n[Step 1/4] 执行台风场景生成...")
+    sys.stdout.flush()
+    
+    original_cwd = os.getcwd()
+    try:
+        os.chdir(str(PROJECT_ROOT))
+        typhoon_cli.main([
+            "one-click",
+            "--tower-excel", str(tower_seg_path),
+            "--final-output", str(cluster_output)
+        ])
+    except SystemExit as exc:
+        if exc.code not in (None, 0):
+            raise RuntimeError(f"台风场景生成失败 (exit code: {exc.code})") from exc
+    finally:
+        os.chdir(original_cwd)
+    
+    step1_time = time.time() - step1_start
+    print(f"[Step 1/4] ✓ 完成，耗时: {step1_time:.2f}秒")
+    sys.stdout.flush()
+    
+    if not cluster_output.exists():
+        raise RuntimeError("台风场景生成失败：聚类结果文件未生成")
+    
+    import gc
+    gc.collect()
+    
+    # Step 2: 场景阶段分类
+    step2_start = time.time()
+    print(f"\n[Step 2/4] 执行场景阶段分类...")
+    sys.stdout.flush()
+    
+    cluster_output_escaped = str(cluster_output).replace("\\", "/")
+    phase_output_escaped = str(phase_output).replace("\\", "/")
+    
+    _call_julia_subprocess(f'''
+run_classify_phases(
+    input_path = "{cluster_output_escaped}",
+    output_path = "{phase_output_escaped}"
+)
+    ''')
+    step2_time = time.time() - step2_start
+    print(f"[Step 2/4] ✓ 完成，耗时: {step2_time:.2f}秒")
+    sys.stdout.flush()
+    
+    case_path_escaped = str(case_path).replace("\\", "/")
+    topology_output_escaped = str(topology_output).replace("\\", "/")
+    dispatch_output_escaped = str(dispatch_output).replace("\\", "/")
+    
+    # Step 3: 滚动拓扑重构
+    step3_start = time.time()
+    print(f"\n[Step 3/4] 执行滚动拓扑重构...")
+    sys.stdout.flush()
+    
+    _call_julia_subprocess(f'''
+run_rolling_reconfiguration(
+    case_file = "{case_path_escaped}",
+    fault_file = "{cluster_output_escaped}",
+    stage_file = "{phase_output_escaped}",
+    output_file = "{topology_output_escaped}"
+)
+    ''')
+    step3_time = time.time() - step3_start
+    print(f"[Step 3/4] ✓ 完成，耗时: {step3_time:.2f}秒")
+    sys.stdout.flush()
+    
+    gc.collect()
+    
+    # Step 4: MESS协同调度
+    step4_start = time.time()
+    print(f"\n[Step 4/4] 执行MESS协同调度 (移动储能求解)...")
+    sys.stdout.flush()
+    
+    # 使用子进程方式调用（与其他步骤一致，避免内存访问违规）
+    _call_julia_subprocess(f'''
+run_mess_dispatch_julia(
+    case_path = "{case_path_escaped}",
+    topology_path = "{topology_output_escaped}",
+    fallback_topology = "{cluster_output_escaped}",
+    output_file = "{dispatch_output_escaped}"
+)
+    ''')
+    
+    # 从临时JSON文件读取key_metrics
+    key_metrics_file = str(dispatch_output).replace(".xlsx", "_key_metrics.json")
+    import json
+    if os.path.exists(key_metrics_file):
+        print(f"[DEBUG] 找到key_metrics文件: {key_metrics_file}")
+        with open(key_metrics_file, 'r', encoding='utf-8') as f:
+            content = f.read()
+            print(f"[DEBUG] JSON文件内容: {content[:500]}...")  # 打印前500字符
+            key_metrics = json.loads(content)
+        print(f"[DEBUG] 已从 {key_metrics_file} 读取关键指标")
+        print(f"[DEBUG] expected_load_shed_total: {key_metrics.get('expected_load_shed_total')}")
+        print(f"[DEBUG] expected_supply_ratio: {key_metrics.get('expected_supply_ratio')}")
+        print(f"[DEBUG] objective_value: {key_metrics.get('objective_value')}")
+        print(f"[DEBUG] violations count: {len(key_metrics.get('violations', []))}")
+    else:
+        print(f"[WARNING] 未找到关键指标文件 {key_metrics_file}，使用默认值")
+        key_metrics = {
+            "expected_load_shed_total": 0.0,
+            "expected_supply_ratio": 1.0,
+            "objective_value": 0.0,
+            "violations": []
+        }
+    
+    step4_time = time.time() - step4_start
+    print(f"[Step 4/4] ✓ 完成，耗时: {step4_time:.2f}秒")
+    sys.stdout.flush()
+    
+    total_time = time.time() - start_time
+    
+    print(f"\n{'='*60}")
+    print(f"[DN-RESILIENCE] ✓ 配电网弹性评估流程完成")
+    print(f"[DN-RESILIENCE] 总耗时: {total_time:.2f}秒")
+    print(f"[DN-RESILIENCE] 移动储能求解结果: {dispatch_output}")
+    print(f"{'='*60}\n")
+    sys.stdout.flush()
+    
+    if not dispatch_output.exists():
+        raise RuntimeError("MESS调度完成，但移动储能求解结果文件未生成")
+    
+    return {
+        "status": "success",
+        "message": "DN-RESILIENCE 配电网弹性评估完成",
+        "input_files": {
+            "tower_seg_file": str(tower_seg_path),
+            "case_file": str(case_path),
+        },
+        "output_files": {
+            "cluster_output": str(cluster_output),
+            "phase_output": str(phase_output),
+            "topology_output": str(topology_output),
+            "dispatch_output": str(dispatch_output),
+        },
+        "execution_time": {
+            "step1_typhoon_generation": f"{step1_time:.2f}s",
+            "step2_phase_classification": f"{step2_time:.2f}s",
+            "step3_topology_reconfig": f"{step3_time:.2f}s",
+            "step4_mess_dispatch": f"{step4_time:.2f}s",
+            "total": f"{total_time:.2f}s",
+        },
+        "dispatch_result_path": str(dispatch_output),
+        "key_metrics": {
+            "expected_load_shed_total": key_metrics.get("expected_load_shed_total"),
+            "expected_supply_ratio": key_metrics.get("expected_supply_ratio"),
+            "objective_value": key_metrics.get("objective_value"),
+            "violations": key_metrics.get("violations", []),
+        }
+    }
+# ======================================================================
+
+
 @app.route("/api/DN-RESILIENCE", methods=["POST"])
 def dn_resilience_route():
     """
-    DN-RESILIENCE 配电网弹性评估API
+    DN-RESILIENCE 配电网弹性评估API (异步模式)
     
     用户需提供两个Excel文件：
     1. tower_seg_file: TowerSeg.xlsx - 配电网塔杆分段结构文件
     2. case_file: ac_dc_real_case.xlsx - 混合交直流配电网算例文件
     
-    执行流程：
+    执行流程（异步执行）：
     Step 1: 台风场景生成 - 生成 mc_simulation_results_k100_clusters.xlsx
     Step 2: 场景阶段分类 - 生成 scenario_phase_classification.xlsx
     Step 3: 滚动拓扑重构 - 生成 topology_reconfiguration_results.xlsx
@@ -543,19 +788,23 @@ def dn_resilience_route():
          "output_dir": "(可选) 输出目录路径"
        }
     
+    返回（异步）：
+    {
+        "status": "started",
+        "task_id": "DN-RESILIENCE_20260121_140316_abc12345",
+        "message": "任务已启动，请使用 /api/TASK/{task_id} 查询进度"
+    }
+    
+    查询任务状态：
+    GET /api/TASK/{task_id}
     返回：
     {
-        "status": "success",
-        "message": "DN-RESILIENCE 配电网弹性评估完成",
-        "input_files": {...},
-        "output_files": {...},
-        "execution_time": {...},
-        "dispatch_result_path": "移动储能求解结果文件路径"
+        "status": "running" | "completed" | "failed",
+        "result": {...},  // 仅当status为completed时
+        "error": "..."    // 仅当status为failed时
     }
     """
     try:
-        start_time = time.time()
-        
         # 1. 处理输入文件
         tower_seg_path = None
         case_path = None
@@ -608,188 +857,69 @@ def dn_resilience_route():
         if not case_path.exists():
             return _error(f"算例文件不存在: {case_path}")
         
-        # 设置输出目录
-        if output_dir:
-            output_dir = Path(output_dir)
-        else:
-            # 默认输出到 data/auto_eval_runs/dn_resilience_<timestamp> 目录
-            timestamp = time.strftime("%Y%m%d_%H%M%S")
-            output_dir = PROJECT_ROOT / "data" / "auto_eval_runs" / f"dn_resilience_{timestamp}"
-        output_dir.mkdir(parents=True, exist_ok=True)
+        # 2. 创建任务
+        task_id = _create_task("DN-RESILIENCE", 
+                              tower_seg_file=str(tower_seg_path),
+                              case_file=str(case_path),
+                              output_dir=output_dir)
         
-        # 定义输出文件路径
-        cluster_output = output_dir / "mc_simulation_results_k100_clusters.xlsx"
-        phase_output = output_dir / "scenario_phase_classification.xlsx"
-        topology_output = output_dir / "topology_reconfiguration_results.xlsx"
-        dispatch_output = output_dir / "mess_dispatch_results.xlsx"
+        # 3. 在后台线程中执行任务
+        thread = threading.Thread(
+            target=_run_task_in_background,
+            args=(task_id, _execute_dn_resilience),
+            kwargs={"tower_seg_path": str(tower_seg_path), 
+                    "case_path": str(case_path), 
+                    "output_dir": output_dir}
+        )
+        thread.daemon = True
+        thread.start()
         
-        print(f"\n{'='*60}")
-        print(f"[DN-RESILIENCE] 开始配电网弹性评估流程")
-        print(f"{'='*60}")
-        print(f"[DN-RESILIENCE] TowerSeg文件: {tower_seg_path}")
-        print(f"[DN-RESILIENCE] 算例文件: {case_path}")
-        print(f"[DN-RESILIENCE] 输出目录: {output_dir}")
-        
-        # ===========================================================
-        # 预初始化Julia运行时（关键！必须在Step 1之前初始化）
-        # 这是为了避免Step 1的Python代码影响PyJulia的状态
-        # ===========================================================
-        print(f"\n[DN-RESILIENCE] 预初始化Julia运行时...")
-        with JULIA_LOCK:
-            runtime.ensure()
-        print(f"[DN-RESILIENCE] Julia运行时初始化完成")
-        
-        # ===========================================================
-        # Step 1: 台风场景生成
-        # ===========================================================
-        step1_start = time.time()
-        print(f"\n[Step 1/4] 执行台风场景生成...")
-        
-        original_cwd = os.getcwd()
-        try:
-            os.chdir(str(PROJECT_ROOT))
-            typhoon_cli.main([
-                "one-click",
-                "--tower-excel", str(tower_seg_path),
-                "--final-output", str(cluster_output)
-            ])
-        except SystemExit as exc:
-            if exc.code not in (None, 0):
-                raise RuntimeError(f"台风场景生成失败 (exit code: {exc.code})") from exc
-        finally:
-            os.chdir(original_cwd)
-        
-        step1_time = time.time() - step1_start
-        print(f"[Step 1/4] ✓ 完成，耗时: {step1_time:.2f}秒")
-        
-        if not cluster_output.exists():
-            return _error("台风场景生成失败：聚类结果文件未生成")
-        
-        # 强制Python GC以清理Step 1产生的大量临时对象
-        # 这有助于避免PyJulia的内存访问冲突
-        import gc
-        gc.collect()
-        
-        # ===========================================================
-        # Step 2: 场景阶段分类
-        # ===========================================================
-        step2_start = time.time()
-        print(f"\n[Step 2/4] 执行场景阶段分类...")
-        sys.stdout.flush()
-
-        # 为 Julia 脚本准备统一格式的路径，避免反斜杠解析问题
-        cluster_output_escaped = str(cluster_output).replace("\\", "/")
-        phase_output_escaped = str(phase_output).replace("\\", "/")
-
-        _call_julia_subprocess(f'''
-run_classify_phases(
-    input_path = "{cluster_output_escaped}",
-    output_path = "{phase_output_escaped}"
-)
-        ''')
-        step2_time = time.time() - step2_start
-        print(f"[Step 2/4] ✓ 完成，耗时: {step2_time:.2f}秒")
-        sys.stdout.flush()
-        
-        # 统一保留这些转义后的路径供后续步骤复用
-        case_path_escaped = str(case_path).replace("\\", "/")
-        topology_output_escaped = str(topology_output).replace("\\", "/")
-        dispatch_output_escaped = str(dispatch_output).replace("\\", "/")
-        
-        # ===========================================================
-        # Step 3: 滚动拓扑重构
-        # 使用子进程执行Julia，完全绕过PyJulia的卡死问题
-        # ===========================================================
-        step3_start = time.time()
-        print(f"\n[Step 3/4] 执行滚动拓扑重构...")
-        sys.stdout.flush()
-        
-        # 使用子进程执行Julia，完全绕过PyJulia的卡死问题
-        _call_julia_subprocess(f'''
-run_rolling_reconfiguration(
-    case_file = "{case_path_escaped}",
-    fault_file = "{cluster_output_escaped}",
-    stage_file = "{phase_output_escaped}",
-    output_file = "{topology_output_escaped}"
-)
-        ''')
-        step3_time = time.time() - step3_start
-        print(f"[Step 3/4] ✓ 完成，耗时: {step3_time:.2f}秒")
-        sys.stdout.flush()
-        
-        # GC清理 Step 3产生的临时对象
-        print(f"[DEBUG] Step 3完成，执行GC清理...")
-        sys.stdout.flush()
-        gc.collect()
-        print(f"[DEBUG] GC清理完成，准备进入Step 4")
-        sys.stdout.flush()
-        
-        # ===========================================================
-        # Step 4: MESS协同调度 (移动储能求解)
-        # 使用子进程执行Julia，完全绕过PyJulia的卡死问题
-        # ===========================================================
-        step4_start = time.time()
-        print(f"\n[Step 4/4] 执行MESS协同调度 (移动储能求解)...")
-        sys.stdout.flush()
-        
-        # 使用子进程执行Julia
-        _call_julia_subprocess(f'''
-run_mess_dispatch_julia(
-    case_path = "{case_path_escaped}",
-    topology_path = "{topology_output_escaped}",
-    fallback_topology = "{cluster_output_escaped}",
-    output_file = "{dispatch_output_escaped}"
-)
-        ''')
-        step4_time = time.time() - step4_start
-        print(f"[Step 4/4] ✓ 完成，耗时: {step4_time:.2f}秒")
-        sys.stdout.flush()
-        
-        total_time = time.time() - start_time
-        
-        print(f"\n{'='*60}")
-        print(f"[DN-RESILIENCE] ✓ 配电网弹性评估流程完成")
-        print(f"[DN-RESILIENCE] 总耗时: {total_time:.2f}秒")
-        print(f"[DN-RESILIENCE] 移动储能求解结果: {dispatch_output}")
-        print(f"{'='*60}\n")
-        sys.stdout.flush()
-        
-        # 检查最终输出文件
-        if not dispatch_output.exists():
-            return _error("MESS调度完成，但移动储能求解结果文件未生成")
-        
+        # 4. 立即返回任务ID
         return jsonify({
-            "status": "success",
-            "message": "DN-RESILIENCE 配电网弹性评估完成",
-            "input_files": {
-                "tower_seg_file": str(tower_seg_path),
-                "case_file": str(case_path),
-            },
-            "output_files": {
-                "cluster_output": str(cluster_output),
-                "phase_output": str(phase_output),
-                "topology_output": str(topology_output),
-                "dispatch_output": str(dispatch_output),
-            },
-            "execution_time": {
-                "step1_typhoon_generation": f"{step1_time:.2f}s",
-                "step2_phase_classification": f"{step2_time:.2f}s",
-                "step3_topology_reconfig": f"{step3_time:.2f}s",
-                "step4_mess_dispatch": f"{step4_time:.2f}s",
-                "total": f"{total_time:.2f}s",
-            },
-            "dispatch_result_path": str(dispatch_output),
+            "status": "started",
+            "task_id": task_id,
+            "message": f"任务已启动，请使用 GET /api/TASK/{task_id} 查询进度",
+            "query_url": f"/api/TASK/{task_id}"
         })
         
     except Exception as exc:
         import traceback
         error_detail = traceback.format_exc()
-        print(f"[DN-RESILIENCE] 错误: {error_detail}")
         return jsonify({
             "status": "error",
-            "message": f"DN-RESILIENCE 弹性评估流程执行失败: {str(exc)}",
+            "message": f"任务创建失败: {str(exc)}",
             "error_detail": error_detail,
         }), 500
+
+
+@app.route("/api/TASK/<task_id>", methods=["GET"])
+def task_status_route(task_id: str):
+    """
+    查询任务状态
+    
+    返回：
+    {
+        "status": "pending" | "running" | "completed" | "failed",
+        "task_type": "DN-RESILIENCE",
+        "created_at": "2026-01-21 14:03:16",
+        "started_at": "2026-01-21 14:03:16",
+        "completed_at": "2026-01-21 14:13:41",  // 仅当status为completed或failed时
+        "result": {...},  // 仅当status为completed时
+        "error": "...",   // 仅当status为failed时
+        "metadata": {...}
+    }
+    """
+    with TASK_LOCK:
+        if task_id not in TASK_STATUS:
+            return _error(f"任务不存在: {task_id}", status=404)
+        
+        task_info = TASK_STATUS[task_id].copy()
+        
+        # 移除敏感信息
+        if "error_detail" in task_info:
+            del task_info["error_detail"]
+        
+        return jsonify(task_info)
 
 
 @app.route("/api/resilience-assessment", methods=["POST"])
