@@ -809,7 +809,8 @@ function getindex(jpc::JPC_tp, key::String)
     elseif key == "nd"
         return size(jpc.loadAC, 1) + size(jpc.loadDC, 1)
     elseif key == "nmg"
-        return size(jpc.pv_acsystem, 1) + size(jpc.pv, 1)
+        # 修改说明：现在所有微电网都存储在 jpc.pv 中
+        return size(jpc.pv, 1)
     # 从 Cft 字典获取子键
     elseif key == "Cft_ac" && haskey(jpc.Cft, :Cft_ac)
         return jpc.Cft[:Cft_ac]
@@ -825,68 +826,80 @@ function getindex(jpc::JPC_tp, key::String)
         return jpc.Cft[:Cdf]
     elseif key == "Cmg" && haskey(jpc.Cft, :Cmg)
         return jpc.Cft[:Cmg]
-    # 计算派生的电力系统参数 (标幺化处理，除以baseMVA)
+    # 计算派生的电力系统参数 
+    # 注意：参考实现使用 kVA 单位，不进行标幺化
     elseif key == "Pd"
-        # 有功负荷向量 (标幺值)
-        baseMVA = jpc.baseMVA
+        # 有功负荷向量 (kVA)
+        # 参考实现: Pd = [row.MVA for AC] ∪ [row.KW for DC]
+        # loadAC[:, 4] 存储的是 MW，需要乘以 1000 转换为 kVA
+        # loadDC[:, 4] 存储的是 MW，需要乘以 1000 转换为 kW
         if size(jpc.loadAC, 1) > 0 || size(jpc.loadDC, 1) > 0
-            pd_ac = size(jpc.loadAC, 1) > 0 ? jpc.loadAC[:, 4] ./ baseMVA : Float64[]
-            pd_dc = size(jpc.loadDC, 1) > 0 ? jpc.loadDC[:, 4] ./ baseMVA : Float64[]
+            pd_ac = size(jpc.loadAC, 1) > 0 ? jpc.loadAC[:, 4] .* 1000.0 : Float64[]  # MW → kVA
+            pd_dc = size(jpc.loadDC, 1) > 0 ? jpc.loadDC[:, 4] .* 1000.0 : Float64[]  # MW → kW
             return vcat(pd_ac, pd_dc)
         else
             return Float64[]
         end
     elseif key == "Qd"
-        # 无功负荷向量 (标幺值)
-        baseMVA = jpc.baseMVA
+        # 无功负荷向量 (kVar)
+        # 参考实现: Qd = [row.MVA/5 for AC] ∪ [row.KW/5 for DC]
         if size(jpc.loadAC, 1) > 0 || size(jpc.loadDC, 1) > 0
-            qd_ac = size(jpc.loadAC, 1) > 0 ? jpc.loadAC[:, 5] ./ baseMVA : Float64[]
-            qd_dc = size(jpc.loadDC, 1) > 0 ? zeros(size(jpc.loadDC, 1)) : Float64[]
+            qd_ac = size(jpc.loadAC, 1) > 0 ? jpc.loadAC[:, 5] .* 1000.0 : Float64[]  # MVar → kVar
+            qd_dc = size(jpc.loadDC, 1) > 0 ? jpc.loadDC[:, 4] .* 1000.0 ./ 5.0 : Float64[]  # MW → kW → kVar (Qd = Pd/5)
             return vcat(qd_ac, qd_dc)
         else
             return Float64[]
         end
     elseif key == "Pgmax"
-        # 发电机最大有功 (标幺值)
-        baseMVA = jpc.baseMVA
+        # 发电机最大有功 (kW)
+        # 参考实现: Pgmax = row.OpMW * 1000
+        # genAC[:, 9] 是 PMAX 列，存储 MW，需要乘以 1000 转换为 kW
         if size(jpc.genAC, 1) > 0
-            return jpc.genAC[:, 9] ./ baseMVA  # PMAX 列
+            return jpc.genAC[:, 9] .* 1000.0  # MW → kW
         else
             return Float64[]
         end
     elseif key == "Qgmax"
-        # 发电机最大无功 (标幺值)
-        baseMVA = jpc.baseMVA
+        # 发电机最大无功 (kVar)
+        # 参考实现: Qgmax = row.OpMvar * 1000
+        # genAC[:, 4] 是 QMAX 列，存储 MVar，需要乘以 1000 转换为 kVar
         if size(jpc.genAC, 1) > 0
-            return jpc.genAC[:, 4] ./ baseMVA  # QMAX 列
+            return jpc.genAC[:, 4] .* 1000.0  # MVar → kVar
         else
             return Float64[]
         end
     elseif key == "Pmgmax"
-        # 微网最大有功 (标幺值)
-        baseMVA = jpc.baseMVA
-        pmg_ac = size(jpc.pv_acsystem, 1) > 0 ? jpc.pv_acsystem[:, 10] ./ baseMVA : Float64[]  # p_mw 列
-        pmg_dc = size(jpc.pv, 1) > 0 ? jpc.pv[:, 3] ./ baseMVA : Float64[]  # p_max 列
-        return vcat(pmg_ac, pmg_dc)
+        # 微网最大有功 (kW)
+        # 参考实现: Pmgmax = row.PVAPower (单位可能是kW)
+        # jpc.pv[:, 3] 是 p_max 列，存储 MW，需要乘以 1000 转换为 kW
+        if size(jpc.pv, 1) > 0
+            return jpc.pv[:, 3] .* 1000.0  # MW → kW
+        else
+            return Float64[]
+        end
     elseif key == "Qmgmax"
-        # 微网最大无功 (标幺值)
-        baseMVA = jpc.baseMVA
-        qmg_ac = size(jpc.pv_acsystem, 1) > 0 ? jpc.pv_acsystem[:, 12] ./ baseMVA : Float64[]  # q_max 列
-        qmg_dc = size(jpc.pv, 1) > 0 ? zeros(size(jpc.pv, 1)) : Float64[]
-        return vcat(qmg_ac, qmg_dc)
+        # 微网最大无功 (kVar)
+        # 参考实现：Qmgmax = Pmgmax / 5 (kW / 5 = kVar)
+        if size(jpc.pv, 1) > 0
+            return jpc.pv[:, 3] .* 1000.0 ./ 5.0  # MW → kW → kVar (kW / 5)
+        else
+            return Float64[]
+        end
     elseif key == "Pvscmax"
-        # VSC 最大功率 (标幺值)
-        baseMVA = jpc.baseMVA
+        # VSC 最大功率 (kW，与参考实现一致)
+        # 参考实现: Pvscmax = row.DckW (直接使用kW值)
+        # 从 converter 矩阵第 CONV_P_MAX_KW 列（索引16）读取
         if size(jpc.converter, 1) > 0
-            return fill(100.0 / baseMVA, size(jpc.converter, 1))  # 默认100MVA转标幺
+            return jpc.converter[:, 16]  # CONV_P_MAX_KW 列，kW值
         else
             return Float64[]
         end
     elseif key == "Smax"
-        # 线路容量限制 (标幺值)
-        baseMVA = jpc.baseMVA
-        smax_ac = size(jpc.branchAC, 1) > 0 ? jpc.branchAC[:, 6] ./ baseMVA : Float64[]  # RATE_A 列
-        smax_dc = size(jpc.branchDC, 1) > 0 ? jpc.branchDC[:, 6] ./ baseMVA : Float64[]
+        # 线路容量限制 (kVA)
+        # 参考实现: Smax = fill(4000, nl) 表示 4000 kVA
+        # branchAC/DC[:, 6] 是 RATE_A 列，存储 MVA，需要乘以 1000 转换为 kVA
+        smax_ac = size(jpc.branchAC, 1) > 0 ? jpc.branchAC[:, 6] .* 1000.0 : Float64[]  # MVA → kVA
+        smax_dc = size(jpc.branchDC, 1) > 0 ? jpc.branchDC[:, 6] .* 1000.0 : Float64[]  # MVA → kVA
         return vcat(smax_ac, smax_dc)
     elseif key == "R"
         # 线路电阻

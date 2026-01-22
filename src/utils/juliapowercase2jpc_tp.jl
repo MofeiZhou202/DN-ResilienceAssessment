@@ -62,6 +62,7 @@ const CONV_P_DC = 6       # 直流功率（MW）
 const CONV_EFF = 7        # 效率
 const CONV_MODE = 8       # 控制模式
 const CONV_DROOP_KP = 9   # Droop系数
+const CONV_P_MAX_KW = 16  # 最大有功功率（kW），来自DckW列，用于Pvscmax
 
 function JuliaPowerCase2Jpc_tp(case::JuliaPowerCase)
     # 1. 创建JPC_tp对象
@@ -601,18 +602,22 @@ function JPC_tp_gens_process(case::JuliaPowerCase, jpc_tp::JPC_tp)
         
         bus_idx = ext.bus_id
         
+        # 使用 Excel 中读取的 OpMW 和 OpMvar 值（与参考实现一致）
+        p_max_mw = ext.p_max_mw
+        q_max_mvar = ext.q_max_mvar
+        
         # 填充发电机数据
         gen_data[i, :] = [
             bus_idx,        # 发电机连接的母线编号
             0.0,            # 有功功率输出(MW)
             0.0,            # 无功功率输出(MVAr)
-            9999.0,         # 最大无功功率输出(MVAr)
-            -9999.0,        # 最小无功功率输出(MVAr)
+            q_max_mvar,     # 最大无功功率输出(MVAr) - 使用 OpMvar
+            -q_max_mvar,    # 最小无功功率输出(MVAr)
             ext.vm_pu,      # 电压幅值设定值(p.u.)
             case.baseMVA,   # 发电机基准容量(MVA)
             1.0,            # 发电机状态(1=运行, 0=停运)
-            9999.0,         # 最大有功功率输出(MW)
-            -9999.0,        # 最小有功功率输出(MW)
+            p_max_mw,       # 最大有功功率输出(MW) - 使用 OpMW
+            0.0,            # 最小有功功率输出(MW)
             0.0,            # PQ能力曲线低端有功功率输出(MW)
             0.0,            # PQ能力曲线高端有功功率输出(MW)
             0.0,            # PC1处最小无功功率输出(MVAr)
@@ -858,7 +863,7 @@ function JPC_tp_loads_process(case::JuliaPowerCase, jpc_tp::JPC_tp)
     # 默认负荷值（当Excel中没有给出负荷值时使用）
     # 配电网级别：使用 kW 量级的默认值
     const_default_p_mw = 0.1    # 默认有功负荷 100 kW = 0.1 MW
-    const_default_q_mvar = 0.01 # 默认无功负荷 10 kVar = 0.01 MVar
+    const_default_q_mvar = 0.02 # 默认无功负荷 20 kVar = 0.02 MVar
     
     # 过滤出投运的负荷 (使用 status 字段)
     in_service_loads = filter(load -> load.status == 1, case.loadsAC)
@@ -877,9 +882,9 @@ function JPC_tp_loads_process(case::JuliaPowerCase, jpc_tp::JPC_tp)
     
     for (i, load) in enumerate(in_service_loads)
         # 使用 pd_mw 和 qd_mvar 字段
-        # 如果Excel中没有给出负荷值（为0或值太小，小于等于1），则使用默认值
-        actual_p_mw = abs(load.pd_mw) <= 1.0 ? const_default_p_mw : load.pd_mw
-        actual_q_mvar = abs(load.qd_mvar) <= 1.0 ? const_default_q_mvar : load.qd_mvar
+        # 只有当值为 0 或负数时才使用默认值
+        actual_p_mw = load.pd_mw <= 0.0 ? const_default_p_mw : load.pd_mw
+        actual_q_mvar = load.qd_mvar <= 0.0 ? const_default_q_mvar : load.qd_mvar
         
         # 填充负荷矩阵的每一行
         load_matrix[i, :] = [
@@ -904,7 +909,7 @@ function JPC_tp_dcloads_process(case::JuliaPowerCase, jpc_tp::JPC_tp)
     # 处理直流负荷数据，转换为JPC_tp格式并更新busDC的PD和QD
     num_acbuses = size(jpc_tp.busAC, 1)
     
-    # 默认负荷值（当Excel中没有给出负荷值或值太小时使用）
+    # 默认负荷值（当Excel中没有给出负荷值时使用）
     # 配电网级别：使用 kW 量级的默认值
     const_default_p_mw = 0.1    # 默认有功负荷 100 kW = 0.1 MW
     
@@ -921,8 +926,8 @@ function JPC_tp_dcloads_process(case::JuliaPowerCase, jpc_tp::JPC_tp)
     dcload_matrix = zeros(num_dcloads, 9)
     
     for (i, dcload) in enumerate(in_service_dcloads)
-        # 如果Excel中没有给出负荷值（为0或值太小，小于等于1MW），则使用默认值
-        actual_p_mw = abs(dcload.pd_mw) <= 1.0 ? const_default_p_mw : dcload.pd_mw
+        # 只有当值为 0 或负数时才使用默认值
+        actual_p_mw = dcload.pd_mw <= 0.0 ? const_default_p_mw : dcload.pd_mw
         
         # 填充直流负荷矩阵的每一行 (使用 pd_mw 和 bus_id 字段)
         dcload_matrix[i, :] = [
@@ -946,24 +951,30 @@ function JPC_tp_dcloads_process(case::JuliaPowerCase, jpc_tp::JPC_tp)
 end
 
 function JPC_tp_pv_process(case::JuliaPowerCase, jpc_tp::JPC_tp)
-    # 处理光伏发电机数据，转换为JPC_tp格式并更新busAC的PD和QD
+    # 处理光伏阵列数据（作为微电网），转换为JPC_tp格式
+    # 修改说明：现在 case.pvarray 包含所有pvarray（AC和DC侧），
+    # 并且 bus_id 已经在 ETAPImporter 中统一编号
+    # （AC母线直接使用ID，DC母线使用ID + AC母线数量）
+    
     num_acbuses = size(jpc_tp.busAC, 1)
     
-    # 过滤出投运的光伏发电机 (使用 status 字段)
+    # 过滤出投运的光伏阵列 (使用 status 字段)
     in_service_pvs = filter(pv -> pv.status == 1, case.pvarray)
     
-    # 如果没有投运的光伏发电机，直接返回
+    # 如果没有投运的光伏阵列，直接返回
     if isempty(in_service_pvs)
-        return
+        @info "没有投运的光伏阵列（微电网）"
+        return jpc_tp
     end
     
-    # 创建一个空矩阵，行数为光伏发电机数，列数为10
+    @info "处理光伏阵列（微电网）: $(length(in_service_pvs)) 个"
+    
+    # 创建一个空矩阵，行数为光伏阵列数，列数为10
     num_pvs = length(in_service_pvs)
     pv_matrix = zeros(num_pvs, 10)
     
     for (i, pv) in enumerate(in_service_pvs)
         # 使用 PVArray 结构体中的字段
-        # voc_v, vmpp_v, isc_a, impp_a, irradiance_w_m2, area_m2, p_rated_mw
         Voc = pv.voc_v
         Vmpp = pv.vmpp_v
         Isc = pv.isc_a * (pv.irradiance_w_m2 / 1000.0)
@@ -972,31 +983,26 @@ function JPC_tp_pv_process(case::JuliaPowerCase, jpc_tp::JPC_tp)
         # 优先使用 Excel 中的额定功率 (PVAPower)，如果没有则计算
         p_max = pv.p_rated_mw > 0.0 ? pv.p_rated_mw : (Vmpp * Impp / 1000000.0)
         
-        # 填充光伏发电机矩阵的每一行
+        # 填充光伏阵列矩阵的每一行
+        # 注意：bus_id 已经在 ETAPImporter 中统一编号，无需再加 num_acbuses
         pv_matrix[i, :] = [
-            i,              # 光伏发电机编号
-            pv.bus_id + num_acbuses,         # 光伏发电机连接的母线编号
-            p_max,          # 光伏发电机有功出力(MW)
-            0,              # 光伏发电机无功出力(MVar)
-            Vmpp,           # 光伏发电机额定电压(V)
-            Isc,            # 光伏发电机短路电流(A)
-            Impp,           # 光伏发电机额定电流(A)
-            pv.irradiance_w_m2,  # 光伏发电机辐照度(W/m²)
-            pv.area_m2,            # area
-            1.0,            # 光伏发电机状态(1=投运)
+            i,              # 光伏阵列编号
+            pv.bus_id,      # 母线编号（已统一：AC直接用ID，DC用ID+AC数量）
+            p_max,          # 光伏阵列有功出力(MW)
+            0,              # 光伏阵列无功出力(MVar)
+            Vmpp,           # 光伏阵列额定电压(V)
+            Isc,            # 光伏阵列短路电流(A)
+            Impp,           # 光伏阵列额定电流(A)
+            pv.irradiance_w_m2,  # 光伏阵列辐照度(W/m²)
+            pv.area_m2,     # 面积
+            1.0,            # 状态(1=投运)
         ]
-        
-        # # 更新busAC矩阵中的PD和QD字段
-        # bus_row = findfirst(x -> x == pv.bus, jpc_tp.busAC[:, 1])
-        
-        # if !isnothing(bus_row)
-        #     jpc_tp.busAC[bus_row, PD] += pv_matrix[i, 4]  # PD - 有功负荷(MW)
-        #     jpc_tp.busAC[bus_row, QD] += pv_matrix[i, 5]  # QD - 无功负荷(MVAr)
-        # end
     end
     
-    # 将光伏发电机数据存储到JPC_tp结构体
+    # 将光伏阵列数据存储到JPC_tp结构体
     jpc_tp.pv = pv_matrix
+    
+    @info "光伏阵列（微电网）数据处理完成: $(num_pvs) 个，Pmgmax = $(pv_matrix[:, 3])"
 
     return jpc_tp
     
@@ -1131,6 +1137,7 @@ function JPC_tp_inverters_process(case::JuliaPowerCase, jpc_tp::JPC_tp)
         converter[1,CONV_P_DC] = p_dc
         converter[1,CONV_EFF] = efficiency
         converter[1,CONV_DROOP_KP] = 0.0  # 默认droop系数
+        converter[1,CONV_P_MAX_KW] = inverter.p_max_kw  # 最大有功功率(kW)，来自DckW列
         converters = vcat(converters, converter)
     end
 
@@ -1214,15 +1221,22 @@ function sparse_matrix(jpc)
     for (i, bus) in enumerate(non_gen_buses)
         Cdf[i, Int(bus)] = 1
     end
-    Cmg_ac = size(jpc.pv_acsystem, 1) > 0 ? zeros(Int, size(jpc.pv_acsystem, 1), nb) : zeros(Int, 0, nb)
-    for mg_index in 1:size(jpc.pv_acsystem, 1)
-        Cmg_ac[mg_index, Int(jpc.pv_acsystem[mg_index, 2])] = 1
+    
+    # 微电网连接矩阵 Cmg
+    # 修改说明：现在所有pvarray都存储在 jpc.pv 中（包含AC和DC侧），
+    # pv_acsystem 不再单独处理，所以只需要处理 jpc.pv
+    nmg = size(jpc.pv, 1)
+    Cmg = nmg > 0 ? zeros(Int, nmg, nb) : zeros(Int, 0, nb)
+    for mg_index in 1:nmg
+        bus_idx = Int(jpc.pv[mg_index, 2])
+        if bus_idx >= 1 && bus_idx <= nb
+            Cmg[mg_index, bus_idx] = 1
+        else
+            @warn "微电网 $mg_index 的母线编号 $bus_idx 超出范围 [1, $nb]"
+        end
     end
-    Cmg_dc = size(jpc.pv, 1) > 0 ? zeros(Int, size(jpc.pv, 1), nb) : zeros(Int, 0, nb)
-    for mg_index in 1:size(jpc.pv, 1)
-        Cmg_dc[mg_index, Int(jpc.pv[mg_index, 2])] = 1
-    end
-    Cmg = vcat(Cmg_ac, Cmg_dc)
+    
+    @info "构建 Cmg 矩阵完成: 微电网数量 = $nmg, 母线总数 = $nb"
 
     C_sparse = Dict(
         :Cft_ac => Cft_ac,

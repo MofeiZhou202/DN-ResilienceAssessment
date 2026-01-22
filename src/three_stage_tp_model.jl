@@ -1288,16 +1288,16 @@ function solve_post_repair_reconfig(jpc, fault_lines, stage1_result, stage2_resu
     # 获取baseMVA用于转换为实际MW值
     baseMVA = jpc["baseMVA"]
     
-    # println("=== 第三阶段：故障修复后重构结果 ===")
-    # println("线路开关状态 (β3): ", β3)
-    # println("孤岛指示 (Is3): ", Is3)
-    # println("节点有功负荷削减 (pls3): ", round.(pls3 .* baseMVA, digits=2), " MW")
-    # println("线路功率 (pij3): ", round.(pij3 .* baseMVA, digits=2), " MW")
-    # println("发电机出力 (pg3): ", round.(pg3 .* baseMVA, digits=2), " MW")
-    # println("微电网发电机出力 (pm3): ", round.(pm3 .* baseMVA, digits=2), " MW")
-    # println("VSC交流传入直流功率 (prec3): ", round.(prec3 .* baseMVA, digits=2), " MW")
-    # println("VSC直流传入交流功率 (pinv3): ", round.(pinv3 .* baseMVA, digits=2), " MW")
-    # println("节点有功负荷削减 (Pls3): ", round(Pls3 * baseMVA, digits=2), " MW")
+    println("=== 第三阶段：故障修复后重构结果 ===")
+    println("线路开关状态 (β3): ", β3)
+    println("孤岛指示 (Is3): ", Is3)
+    println("节点有功负荷削减 (pls3): ", round.(pls3 .* baseMVA, digits=2), " MW")
+    println("线路功率 (pij3): ", round.(pij3 .* baseMVA, digits=2), " MW")
+    println("发电机出力 (pg3): ", round.(pg3 .* baseMVA, digits=2), " MW")
+    println("微电网发电机出力 (pm3): ", round.(pm3 .* baseMVA, digits=2), " MW")
+    println("VSC交流传入直流功率 (prec3): ", round.(prec3 .* baseMVA, digits=2), " MW")
+    println("VSC直流传入交流功率 (pinv3): ", round.(pinv3 .* baseMVA, digits=2), " MW")
+    println("节点有功负荷削减 (Pls3): ", round(Pls3 * baseMVA, digits=2), " MW")
     
     return Dict(
         :β3 => β3, :Is3 => Is3, 

@@ -51,7 +51,7 @@ function load_julia_power_data(file_path::String)
             ("util", load_ext_grids!),
             ("hvcb", load_switches! ),
             ("pvarray", load_pv_arrays!),
-            ("pvarray", load_ac_pv_system!),
+            # ("pvarray", load_ac_pv_system!),  # 已在 load_pv_arrays! 中处理，无需重复加载
             ("switch", load_switches!), # To do
             # ("equipment_carbon", load_carbons!), # To do 
             # ("carbon_time_series", load_carbon_time_series!), # To do
@@ -1066,22 +1066,21 @@ function load_loads!(case::JuliaPowerCase, file_path::String, sheet_name::String
                     continue
                 end
                 
-                # 从行数据中提取功率值
-                # 优先使用 MVA * PF 计算，如果结果为0，使用 MTLoadPercent (这是kVA单位)
-                s_mva = safe_get_value(row[:mva], 0.0, Float64) / 1000  # MVA列实际是kVA，除以1000转换为MVA
-                pf = safe_get_value(row[:pf], 0.0, Float64) / 100  # PF列是百分比
+                # 负荷功率处理 - 与参考实现一致
+                # 参考实现直接使用 MVA 列作为 kVA 值，Qd = MVA/5
+                # 注意：Excel 中的 MVA 列实际存储的是 kVA 值（如 100, 300 等）
+                mva_kva = safe_get_value(row[:mva], 0.0, Float64)  # MVA列实际是kVA
                 
-                if s_mva > 0 && pf > 0
-                    p_mw = s_mva * pf
-                    q_mvar = s_mva * sqrt(max(0, 1 - pf^2))
+                if mva_kva > 0
+                    # 与参考实现一致：直接使用 MVA 值作为 kVA，转换为 MW
+                    p_mw = mva_kva / 1000.0  # kVA -> MW
+                    q_mvar = mva_kva / 5.0 / 1000.0  # Q = P/5，然后 kVar -> MVar
                 else
-                    # 如果 MVA 或 PF 为 0，尝试使用 MTLoadPercent 作为 kVA 值
+                    # 如果 MVA 为 0，尝试使用 MTLoadPercent 作为 kVA 值
                     mt_load_kva = haskey(row, :mtloadpercent) ? safe_get_value(row[:mtloadpercent], 0.0, Float64) : 0.0
                     if mt_load_kva > 0
-                        # MTLoadPercent 是 kVA 单位，转换为 MW（假设功率因数 0.9）
-                        default_pf = 0.9
-                        p_mw = mt_load_kva / 1000 * default_pf  # kVA -> MVA -> MW
-                        q_mvar = mt_load_kva / 1000 * sqrt(1 - default_pf^2)
+                        p_mw = mt_load_kva / 1000.0  # kVA -> MW
+                        q_mvar = mt_load_kva / 5.0 / 1000.0  # Q = P/5
                         @info "行 $i: 负荷 $name 使用 MTLoadPercent=$mt_load_kva kVA (P=$(round(p_mw*1000, digits=1)) kW)"
                     else
                         # 都没有值，使用默认值
@@ -2472,19 +2471,25 @@ function load_converters!(case::JuliaPowerCase, file_path::String, sheet_name::S
                     vm_dc_pu = 1.0
                 end
                 
-                loss_percent = 1-(haskey(row, :dcpercenteff) ? safe_get_value(row[:dcpercenteff], 0.0, Float64) : 0.0)/100
+                # 读取效率 (DcPercentEFF列，值如90表示90%效率)
+                # 参考实现: η = row.DcPercentEFF / 100
+                efficiency = (haskey(row, :dcpercenteff) ? safe_get_value(row[:dcpercenteff], 97.0, Float64) : 97.0) / 100.0
                 loss_mw = haskey(row, :loss_mw) ? safe_get_value(row[:loss_mw], 0.0, Float64) : 0.0
                 
-                # 验证损耗是否合理
-                if loss_percent < 0.0
-                    @warn "行 $i: 换流器 $name (ID: $index) 的损耗百分比无效 ($loss_percent%)，设置为 0%"
-                    loss_percent = 0.0
+                # 验证效率是否合理
+                if efficiency <= 0.0 || efficiency > 1.0
+                    @warn "行 $i: 换流器 $name (ID: $index) 的效率无效 ($efficiency)，设置为 0.97"
+                    efficiency = 0.97
                 end
                 
                 if loss_mw < 0.0
                     @warn "行 $i: 换流器 $name (ID: $index) 的损耗功率无效 ($loss_mw MW)，设置为 0 MW"
                     loss_mw = 0.0
                 end
+                
+                # 读取最大功率 (DckW列，用于Pvscmax)
+                # 参考实现: Pvscmax = row.DckW (kW)
+                p_max_kw = haskey(row, :dckw) ? safe_get_value(row[:dckw], 0.0, Float64) : 0.0
                 
                 max_p_mw = (haskey(row, :kwmax) ? safe_get_value(row[:kwmax], 0.0, Float64) : 0.0)/1000
                 min_p_mw = (haskey(row, :kwmin) ? safe_get_value(row[:kwmin], 0.0, Float64) : 0.0)/1000
@@ -2524,8 +2529,9 @@ function load_converters!(case::JuliaPowerCase, file_path::String, sheet_name::S
                     dc_bus_id=bus_dc,
                     p_ac_mw=p_mw,
                     q_ac_mvar=q_mvar,
-                    p_dc_mw=p_mw * (1.0 - loss_percent/100.0),  # 估算直流侧功率
-                    efficiency=1.0 - loss_percent/100.0,
+                    p_dc_mw=p_mw * efficiency,  # 估算直流侧功率
+                    efficiency=efficiency,
+                    p_max_kw=p_max_kw,
                     mode=mode_int,
                     status=in_service ? 1 : 0
                 ))
@@ -2837,6 +2843,10 @@ function load_ext_grids!(case::JuliaPowerCase, file_path::String, sheet_name::St
                 # 可控性
                 controllable = haskey(row, :controllable) ? parse_bool(safe_get_value(row[:controllable], false)) : false
                 
+                # 读取功率参数 (OpMW 和 OpMvar 列) - 与参考实现一致
+                p_max_mw = haskey(row, :opmw) ? safe_get_value(row[:opmw], 9999.0, Float64) : 9999.0
+                q_max_mvar = haskey(row, :opmvar) ? safe_get_value(row[:opmvar], 9999.0, Float64) : 9999.0
+                
                 # 创建ExternalGrid对象并添加到case中
                 push!(case.ext_grids, ExternalGrid(
                     index=index,
@@ -2844,6 +2854,8 @@ function load_ext_grids!(case::JuliaPowerCase, file_path::String, sheet_name::St
                     bus_id=bus,
                     vm_pu=vm_pu,
                     va_deg=va_degree,
+                    p_max_mw=p_max_mw,
+                    q_max_mvar=q_max_mvar,
                     status=in_service ? 1 : 0
                 ))
                 
@@ -3043,7 +3055,7 @@ end
 function load_pv_arrays!(case::JuliaPowerCase, file_path::String, sheet_name::String)
     try
         # 使用DataFrame处理
-        @info "正在读取光伏阵列数据..."
+        @info "正在读取光伏阵列数据（作为微电网处理，包含AC和DC侧）..."
         df = DataFrame(XLSX.readtable(file_path, sheet_name))
         
         # 确保数据不为空
@@ -3055,8 +3067,9 @@ function load_pv_arrays!(case::JuliaPowerCase, file_path::String, sheet_name::St
         # 将列名转换为小写
         rename!(df, lowercase.(names(df)))
         
-        # 验证必要的列是否存在
-        required_columns = [:index, :id, :bus, :numpanelseries, :numpanelparallel, :vmpp, :impp, :voc, :isc, :pvanumcells]
+        # 验证必要的列是否存在（只需要基本列：index, id, bus）
+        # 对于拓扑重构，主要需要 PVAPower 列
+        required_columns = [:index, :id, :bus]
         missing_columns = filter(col -> !(col in Symbol.(lowercase.(names(df)))), required_columns)
         
         if !isempty(missing_columns)
@@ -3064,11 +3077,16 @@ function load_pv_arrays!(case::JuliaPowerCase, file_path::String, sheet_name::St
             return
         end
         
+        # 获取AC母线数量，用于计算统一母线编号
+        num_ac_buses = length(case.busesAC)
+        
         # 记录处理的行数和错误的行数
         processed_rows = 0
         error_rows = 0
+        dc_count = 0
+        ac_count = 0
         
-        # 遍历每一行数据
+        # 遍历每一行数据（按参考实现，加载所有pvarray作为微电网）
         for (i, row) in enumerate(eachrow(df))
             try
                 # 从行数据中提取字段值
@@ -3086,14 +3104,26 @@ function load_pv_arrays!(case::JuliaPowerCase, file_path::String, sheet_name::St
                 # 从母线名称映射到母线ID
                 bus_name = safe_get_value(row[:bus], "", String)
                 
-                # 检查母线是否在 DC 母线字典中
-                # 如果不在 DC 母线字典中，跳过（可能是 AC 侧光伏）
-                if !haskey(case.busdc_name_to_id, bus_name)
-                    # @warn "行 $i: 光伏阵列 $name (ID: $index) 的母线名称 '$bus_name' 不在DC母线字典中，跳过此行（可能是AC侧光伏）"
+                # 统一母线编号：检查AC和DC母线字典
+                bus_id = 0
+                is_dc_bus = false
+                
+                if haskey(case.busdc_name_to_id, bus_name)
+                    # DC母线：bus_id = DC母线ID + AC母线数量（统一编号）
+                    dc_bus_id = case.busdc_name_to_id[bus_name]
+                    bus_id = dc_bus_id + num_ac_buses
+                    is_dc_bus = true
+                    dc_count += 1
+                elseif haskey(case.bus_name_to_id, bus_name)
+                    # AC母线：直接使用AC母线ID
+                    bus_id = case.bus_name_to_id[bus_name]
+                    is_dc_bus = false
+                    ac_count += 1
+                else
+                    @warn "行 $i: 光伏阵列 $name (ID: $index) 的母线名称 '$bus_name' 既不在AC也不在DC母线字典中，跳过此行"
+                    error_rows += 1
                     continue
                 end
-                
-                bus_id = case.busdc_name_to_id[bus_name]
                 
                 # 验证母线索引是否有效
                 if bus_id <= 0
@@ -3102,70 +3132,38 @@ function load_pv_arrays!(case::JuliaPowerCase, file_path::String, sheet_name::St
                     continue
                 end
                 
-                # 检查母线是否存在
-                if !any(b -> b.index == bus_id, case.busesDC)
-                    @warn "行 $i: 光伏阵列 $name (ID: $index) 连接到不存在的母线 ($bus_id)，跳过此行"
-                    error_rows += 1
-                    continue
-                end
+                # 提取光伏阵列参数（使用默认值如果列不存在）
+                numpanelseries = haskey(row, :numpanelseries) ? safe_get_value(row[:numpanelseries], 1, Int) : 1
+                numpanelparallel = haskey(row, :numpanelparallel) ? safe_get_value(row[:numpanelparallel], 1, Int) : 1
+                vmpp = haskey(row, :vmpp) ? safe_get_value(row[:vmpp], 800.0, Float64) : 800.0
+                impp = haskey(row, :impp) ? safe_get_value(row[:impp], 9.0, Float64) : 9.0
+                voc = haskey(row, :voc) ? safe_get_value(row[:voc], 1000.0, Float64) : 1000.0
+                isc = haskey(row, :isc) ? safe_get_value(row[:isc], 10.0, Float64) : 10.0
                 
-                # 提取光伏阵列参数
-                numpanelseries = safe_get_value(row[:numpanelseries], 0, Int)
-                numpanelparallel = safe_get_value(row[:numpanelparallel], 0, Int)
-                vmpp = safe_get_value(row[:vmpp], 0.0, Float64)
-                impp = safe_get_value(row[:impp], 0.0, Float64)
-                voc = safe_get_value(row[:voc], 0.0, Float64)
-                isc = safe_get_value(row[:isc], 0.0, Float64)
-                pvanumcells = safe_get_value(row[:pvanumcells], 0, Int)
-                
-                # 验证参数值是否有效
+                # 使用宽松验证：使用默认值而不是跳过
                 if numpanelseries <= 0
-                    @warn "行 $i: 光伏阵列 $name (ID: $index) 的串联面板数量无效 ($numpanelseries)，跳过此行"
-                    error_rows += 1
-                    continue
+                    numpanelseries = 1
                 end
-                
                 if numpanelparallel <= 0
-                    @warn "行 $i: 光伏阵列 $name (ID: $index) 的并联面板数量无效 ($numpanelparallel)，跳过此行"
-                    error_rows += 1
-                    continue
+                    numpanelparallel = 1
                 end
-                
                 if vmpp <= 0.0
-                    @warn "行 $i: 光伏阵列 $name (ID: $index) 的最大功率点电压无效 ($vmpp V)，跳过此行"
-                    error_rows += 1
-                    continue
+                    vmpp = 800.0
                 end
-                
                 if impp <= 0.0
-                    @warn "行 $i: 光伏阵列 $name (ID: $index) 的最大功率点电流无效 ($impp A)，跳过此行"
-                    error_rows += 1
-                    continue
+                    impp = 9.0
                 end
-                
                 if voc <= 0.0
-                    @warn "行 $i: 光伏阵列 $name (ID: $index) 的开路电压无效 ($voc V)，跳过此行"
-                    error_rows += 1
-                    continue
+                    voc = 1000.0
                 end
-                
                 if isc <= 0.0
-                    @warn "行 $i: 光伏阵列 $name (ID: $index) 的短路电流无效 ($isc A)，跳过此行"
-                    error_rows += 1
-                    continue
-                end
-                
-                if pvanumcells <= 0
-                    @warn "行 $i: 光伏阵列 $name (ID: $index) 的电池数量无效 ($pvanumcells)，跳过此行"
-                    error_rows += 1
-                    continue
+                    isc = 10.0
                 end
                 
                 #温度参数
                 temperature = haskey(row, :temperature) ? safe_get_value(row[:temperature], 25.0, Float64) : 25.0
                 # 验证温度值是否合理
                 if temperature < -40.0 || temperature > 85.0
-                    @warn "行 $i: 光伏阵列 $name (ID: $index) 的温度值无效 ($temperature °C)，设置为默认值 25.0 °C"
                     temperature = 25.0
                 end
 
@@ -3173,25 +3171,21 @@ function load_pv_arrays!(case::JuliaPowerCase, file_path::String, sheet_name::St
                 irradiance = haskey(row, :irradiance) ? safe_get_value(row[:irradiance], 1000.0, Float64) : 1000.0
                 # 验证光照强度值是否合理
                 if irradiance < 0.0 || irradiance > 2000.0
-                    @warn "行 $i: 光伏阵列 $name (ID: $index) 的光照强度值无效 ($irradiance W/m²)，设置为默认值 1000.0 W/m²"
                     irradiance = 1000.0
                 end
 
-                # 额外参数
-                α_isc = haskey(row, :aisctemp) ? safe_get_value(row[:aisctemp], 0.0, Float64) : 0.0
-
-                β_voc = haskey(row, :bvoctemp) ? safe_get_value(row[:bvoctemp], 0.0, Float64) : 0.0
                 # 运行状态
                 in_service = haskey(row, :inservice) ? parse_bool(safe_get_value(row[:inservice], true)) : true
                 
-                # 读取额定功率 (PVAPower 列)，单位为 MW
+                # 读取额定功率 (PVAPower 列)，单位为 MW - 这是拓扑重构最关键的参数
                 p_rated_mw = haskey(row, :pvapower) ? safe_get_value(row[:pvapower], 0.0, Float64) : 0.0
                 
                 # 创建PVArray对象并添加到case中
+                # 注意：bus_id 已经是统一编号（AC母线直接用ID，DC母线用ID+AC母线数量）
                 push!(case.pvarray, PVArray(
                     index=index,
                     name=name,
-                    bus_id=bus_id,
+                    bus_id=bus_id,  # 统一母线编号
                     voc_v=voc,
                     vmpp_v=vmpp,
                     isc_a=isc,
@@ -3202,9 +3196,6 @@ function load_pv_arrays!(case::JuliaPowerCase, file_path::String, sheet_name::St
                     p_rated_mw=p_rated_mw
                 ))
                 
-                # 更新索引映射（如果需要）
-                # case.pvarray_indices[index] = length(case.pvarrays)
-                
                 processed_rows += 1
                 
             catch e
@@ -3213,7 +3204,7 @@ function load_pv_arrays!(case::JuliaPowerCase, file_path::String, sheet_name::St
             end
         end
         
-        @info "光伏阵列数据加载完成: 成功处理 $processed_rows 行，错误 $error_rows 行"
+        @info "光伏阵列数据加载完成: 成功处理 $processed_rows 行 (AC侧: $ac_count, DC侧: $dc_count)，错误 $error_rows 行"
         
     catch e
         @error "加载光伏阵列数据时出错" exception=(e, catch_backtrace())

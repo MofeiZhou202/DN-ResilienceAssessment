@@ -403,21 +403,21 @@ function load_hybrid_case(case_path::AbstractString, mess_configs::Vector{MESSCo
     Cmg = C_sparse[:Cmg]
     Cd = C_sparse[:Cd]
 
-    # 获取负荷数据（转换为 kW）
-    Pd = jpc_tp[:Pd] .* baseMVA .* 1000  # 标幺值 -> MW -> kW
-    Qd = jpc_tp[:Qd] .* baseMVA .* 1000  # 标幺值 -> MW -> kW
+    # 获取负荷数据（Types.jl 已返回 kW）
+    Pd = jpc_tp[:Pd]  # 已经是 kW
+    Qd = jpc_tp[:Qd]  # 已经是 kVar
     
-    # 获取发电机数据（转换为 kW）
-    Pgmax = jpc_tp[:Pgmax] .* baseMVA .* 1000  # MW -> kW
-    Qgmax = jpc_tp[:Qgmax] .* baseMVA .* 1000  # MW -> kW
+    # 获取发电机数据（Types.jl 已返回 kW）
+    Pgmax = jpc_tp[:Pgmax]  # 已经是 kW
+    Qgmax = jpc_tp[:Qgmax]  # 已经是 kVar
     
-    # 获取微网/光伏数据（转换为 kW）
-    Pmgmax = jpc_tp[:Pmgmax] .* baseMVA .* 1000  # MW -> kW
-    Qmgmax = jpc_tp[:Qmgmax] .* baseMVA .* 1000  # MVar -> kVar
+    # 获取微网/光伏数据（Types.jl 已返回 kW）
+    Pmgmax = jpc_tp[:Pmgmax]  # 已经是 kW
+    Qmgmax = jpc_tp[:Qmgmax]  # 已经是 kVar
     nmg = jpc_tp[:nmg]
     
-    # 获取 VSC 数据（转换为 kW）
-    Pvscmax = jpc_tp[:Pvscmax] .* baseMVA .* 1000  # MW -> kW
+    # 获取 VSC 数据（Types.jl 已返回 kW）
+    Pvscmax = jpc_tp[:Pvscmax]  # 已经是 kW
     eta_vsc = fill(0.95, nl_vsc)  # 默认效率 95%
     if size(jpc_tp.converter, 1) > 0 && size(jpc_tp.converter, 2) >= 9
         for i in 1:nl_vsc
@@ -898,7 +898,7 @@ function optimize_hybrid_dispatch(case::HybridGridCase, statuses, weights::Union
     model = Model(Gurobi.Optimizer)
     set_optimizer_attribute(model, "OutputFlag", 1)
     set_optimizer_attribute(model, "LogToConsole", 1)
-    set_optimizer_attribute(model, "TimeLimit",200)
+    set_optimizer_attribute(model, "TimeLimit",350)
     set_optimizer_attribute(model, "MIPGap", 0.01)
 
     objective_expr = JuMP.AffExpr(0.0)

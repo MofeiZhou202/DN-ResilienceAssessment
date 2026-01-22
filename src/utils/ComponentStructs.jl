@@ -474,6 +474,7 @@ mutable struct Converter
     q_ac_mvar::Float64
     p_dc_mw::Float64
     efficiency::Float64
+    p_max_kw::Float64     # 最大有功出力 (kW)，来自 DckW 列，用于 Pvscmax
     mode::Int
     status::Int
     
@@ -486,15 +487,16 @@ mutable struct Converter
         q_ac_mvar=0.0,
         p_dc_mw=0.0,
         efficiency=0.97,
+        p_max_kw=0.0,
         mode=1,
         status=1)
-        return new(index, name, ac_bus_id, dc_bus_id, p_ac_mw, q_ac_mvar, p_dc_mw, efficiency, mode, status)
+        return new(index, name, ac_bus_id, dc_bus_id, p_ac_mw, q_ac_mvar, p_dc_mw, efficiency, p_max_kw, mode, status)
     end
 end
 
 # ========== 外部电网 ==========
 """
-    外部电网
+    外部电网 (用于拓扑重构的发电机模型)
 """
 mutable struct ExternalGrid
     index::Int
@@ -502,6 +504,8 @@ mutable struct ExternalGrid
     bus_id::Int
     vm_pu::Float64
     va_deg::Float64
+    p_max_mw::Float64     # 最大有功出力 (MW)，来自 OpMW 列
+    q_max_mvar::Float64   # 最大无功出力 (MVar)，来自 OpMvar 列
     status::Int
     
     function ExternalGrid(;
@@ -510,8 +514,10 @@ mutable struct ExternalGrid
         bus_id=0,
         vm_pu=1.0,
         va_deg=0.0,
+        p_max_mw=9999.0,
+        q_max_mvar=9999.0,
         status=1)
-        return new(index, name, bus_id, vm_pu, va_deg, status)
+        return new(index, name, bus_id, vm_pu, va_deg, p_max_mw, q_max_mvar, status)
     end
 end
 
