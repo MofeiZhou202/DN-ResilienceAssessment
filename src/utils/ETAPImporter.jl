@@ -2263,13 +2263,17 @@ function load_storages!(case::JuliaPowerCase, file_path::String, sheet_name::Str
                 # 从母线名称映射到母线ID
                 bus_name = safe_get_value(row[:bus], "", String)
                 
-                # 使用case.bus_name_to_id字典将母线名称转换为整数ID
+                # 使用交流或直流母线映射将名称转换为整数ID
                 bus = 0
-                
+                is_ac_bus = false
+
                 if haskey(case.busdc_name_to_id, bus_name)
                     bus = case.busdc_name_to_id[bus_name]
+                elseif haskey(case.bus_name_to_id, bus_name)
+                    bus = case.bus_name_to_id[bus_name]
+                    is_ac_bus = true
                 else
-                    @warn "行 $i: 储能设备 $name (ID: $index) 的母线名称 '$bus_name' 在bus_name_to_id字典中不存在，跳过此行"
+                    @warn "行 $i: 储能设备 $name (ID: $index) 的母线名称 '$bus_name' 在交流/直流母线映射中不存在，跳过此行"
                     error_rows += 1
                     continue
                 end
@@ -2282,10 +2286,18 @@ function load_storages!(case::JuliaPowerCase, file_path::String, sheet_name::Str
                 end
                 
                 # 检查母线是否存在
-                if !any(b -> b.index == bus, case.busesDC)
-                    @warn "行 $i: 储能设备 $name (ID: $index) 连接到不存在的母线 ($bus)，跳过此行"
-                    error_rows += 1
-                    continue
+                if is_ac_bus
+                    if !any(b -> b.index == bus, case.busesAC)
+                        @warn "行 $i: 储能设备 $name (ID: $index) 连接到不存在的交流母线 ($bus)，跳过此行"
+                        error_rows += 1
+                        continue
+                    end
+                else
+                    if !any(b -> b.index == bus, case.busesDC)
+                        @warn "行 $i: 储能设备 $name (ID: $index) 连接到不存在的直流母线 ($bus)，跳过此行"
+                        error_rows += 1
+                        continue
+                    end
                 end
                 
                 # ETAP储能设备特有参数

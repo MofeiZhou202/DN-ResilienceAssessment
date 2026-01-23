@@ -56,7 +56,7 @@ function _write_df_sheet!(workbook, sheet_name::AbstractString, df::DataFrame)
     end
 end
 
-function _export_mess_report(output_path::AbstractString, result::Dict{String, Any}, node_violation_prob::Dict{Int, Float64}, node_violation_breakdown::Dict{Int, Dict{Int, Float64}})
+function _export_mess_report(output_path::AbstractString, result::Dict{String, Any}, node_violation_prob::Dict{Int, Float64}, node_violation_breakdown::Dict{Int, Dict{Int, Float64}}, node_names::Vector{String})
     _ensure_parent_dir(output_path)
     summary_df = DataFrame(
         指标 = ["期望调度目标", "期望削减负荷 (kW·h)", "期望供电率 (%)"],
@@ -66,6 +66,14 @@ function _export_mess_report(output_path::AbstractString, result::Dict{String, A
             round(result["expected_supply_ratio"] * 100, digits=2),
         ],
     )
+
+    lookup_name = function (node_id::Int)
+        if 1 <= node_id <= length(node_names)
+            name = strip(String(node_names[node_id]))
+            return isempty(name) ? "Node$(node_id)" : name
+        end
+        return "Node$(node_id)"
+    end
 
     violation_df = if isempty(node_violation_prob)
         DataFrame(信息 = ["所有节点在全部场景中均满足连续断电约束"])
@@ -79,6 +87,7 @@ function _export_mess_report(output_path::AbstractString, result::Dict{String, A
             compliance_prob = max(0.0, 1.0 - total_prob)
             push!(rows, (
                 节点 = node_id,
+                节点名称 = lookup_name(node_id),
                 最长连续断电小时 = maximum(durations),
                 超标概率 = round(total_prob, digits=4),
                 满足概率 = round(compliance_prob, digits=4),
@@ -177,10 +186,30 @@ struct HybridGridCase
     transport_node_to_grid::Dict{Int, Int}
     transport_grid_to_node::Dict{Int, Int}
     mess_transport_initial::Vector{Int}
+    node_names::Vector{String}
     mess_names::Vector{String}
     Cft_ac_rows::Vector{Vector{Tuple{Int, Float64}}}
     Cft_dc_rows::Vector{Vector{Tuple{Int, Float64}}}
     Cft_vsc_rows::Vector{Vector{Tuple{Int, Float64}}}
+end
+
+function _node_name(case::HybridGridCase, node_id::Int)
+    if 1 <= node_id <= length(case.node_names)
+        name = strip(case.node_names[node_id])
+        return isempty(name) ? "Node$(node_id)" : name
+    end
+    return "Node$(node_id)"
+end
+
+function _node_label(case::HybridGridCase, node_id::Int)
+    return string(_node_name(case, node_id), " (ID ", node_id, ")")
+end
+
+function _node_label_or_unknown(case::HybridGridCase, node_id::Union{Nothing, Int})
+    if node_id === nothing || node_id <= 0
+        return "?"
+    end
+    return _node_label(case, node_id)
 end
 
 # 默认 MESS 配置 (单位: kW, kWh)
@@ -521,6 +550,37 @@ function load_hybrid_case(case_path::AbstractString, mess_configs::Vector{MESSCo
     Cmg_f = sparse(Float64.(Cmg))
     Cd_f = sparse(Float64.(Cd))
 
+    node_names = fill("", nb)
+    for (row_idx, bus) in enumerate(julia_case.busesAC)
+        bus_id = if row_idx <= size(jpc_tp.busAC, 1)
+            Int(round(jpc_tp.busAC[row_idx, BUS_ID]))
+        else
+            Int(round(bus.index))
+        end
+        if 1 <= bus_id <= nb
+            raw_name = getfield(bus, :name)
+            name = raw_name === nothing || raw_name === missing ? "" : strip(string(raw_name))
+            node_names[bus_id] = isempty(name) ? "Node$(bus_id)" : name
+        end
+    end
+    for (row_idx, bus) in enumerate(julia_case.busesDC)
+        bus_id = if row_idx <= size(jpc_tp.busDC, 1)
+            Int(round(jpc_tp.busDC[row_idx, BUS_ID]))
+        else
+            Int(round(bus.index + nb_ac))
+        end
+        if 1 <= bus_id <= nb
+            raw_name = getfield(bus, :name)
+            name = raw_name === nothing || raw_name === missing ? "" : strip(string(raw_name))
+            node_names[bus_id] = isempty(name) ? "Node$(bus_id)" : name
+        end
+    end
+    for idx in 1:nb
+        if isempty(node_names[idx])
+            node_names[idx] = "Node$(idx)"
+        end
+    end
+
     case = HybridGridCase(
         nb,
         nb_ac,
@@ -577,6 +637,7 @@ function load_hybrid_case(case_path::AbstractString, mess_configs::Vector{MESSCo
         transport_node_to_grid_map,
         transport_grid_to_node_map,
         mess_transport_initial_nodes,
+        node_names,
         mess_names,
         _row_entries(Cft_ac_f),
         _row_entries(Cft_dc_f),
@@ -598,7 +659,7 @@ function schedule_departure_grid(case::HybridGridCase, transport_node::Int)
     if grid_idx === nothing
         return "Node?"
     end
-    return "Node" * string(grid_idx)
+    return _node_label(case, grid_idx)
 end
 
 schedule_transport_grid_label(case::HybridGridCase, transport_node::Int) = schedule_departure_grid(case, transport_node)
@@ -709,13 +770,13 @@ function _collect_mobility_log(case::HybridGridCase, schedule::MessMobilitySched
             entry = if traveling_action !== nothing
                 origin_idx = get(case.transport_node_to_grid, traveling_action.origin, nothing)
                 destination_idx = get(case.transport_node_to_grid, traveling_action.destination, nothing)
-                string(origin_idx === nothing ? "?" : string(origin_idx), "->", destination_idx === nothing ? "?" : string(destination_idx))
+                string(_node_label_or_unknown(case, origin_idx), "->", _node_label_or_unknown(case, destination_idx))
             else
                 loc_vals = [value(schedule.u_vars[t + 1][m_idx, node]) for node in 1:schedule.nb_transport]
                 if any(v -> v > 0.5, loc_vals)
                     transport_node = argmax(loc_vals)
                     grid_idx = get(case.transport_node_to_grid, transport_node, nothing)
-                    grid_idx === nothing ? "?" : string(grid_idx)
+                    _node_label_or_unknown(case, grid_idx)
                 else
                     "Unknown"
                 end
@@ -1292,9 +1353,15 @@ function run_mess_dispatch_julia(; case_path::AbstractString=DEFAULT_CASE_XLSX,
                 println("$(mess_name) Power (kW): $(power)")
                 unique_locs = sort(unique(filter(x -> x > 0, location)))
                 if length(unique_locs) > 1
-                    println("  → ✅ $(mess_name) 发生了移动! 访问了节点: $(unique_locs)")
+                    visited = [ _node_label(case, loc) for loc in unique_locs ]
+                    println("  → ✅ $(mess_name) 发生了移动! 访问了节点: $(join(visited, ", "))")
                 else
-                    println("  → ⚠️ $(mess_name) 未移动，始终在节点 $(unique_locs)")
+                    if isempty(unique_locs)
+                        println("  → ⚠️ $(mess_name) 未能确定停留节点")
+                    else
+                        stay_label = _node_label(case, unique_locs[1])
+                        println("  → ⚠️ $(mess_name) 未移动，始终在节点 $(stay_label)")
+                    end
                 end
             end
         end
@@ -1304,7 +1371,8 @@ function run_mess_dispatch_julia(; case_path::AbstractString=DEFAULT_CASE_XLSX,
             println("\n⚠️ 场景 $(idx) 中连续断电超过 $(NO_POWER_MAX_CONSECUTIVE_HOURS) 小时的节点：")
             for node_id in sort(collect(keys(violations)))
                 duration = violations[node_id]
-                println("  - 节点 $(node_id): 最长 $(duration) 小时无电")
+                label = _node_label(case, node_id)
+                println("  - $(label): 最长 $(duration) 小时无电")
                 scenario_prob = prob
                 stats = get!(node_violation_breakdown, node_id, Dict{Int, Float64}())
                 stats[duration] = get(stats, duration, 0.0) + scenario_prob
@@ -1325,7 +1393,8 @@ function run_mess_dispatch_julia(; case_path::AbstractString=DEFAULT_CASE_XLSX,
             stats = node_violation_breakdown[node_id]
             longest = maximum(keys(stats))
             total_prob = node_violation_prob[node_id]
-            @printf("  - 节点 %d: 最长连续 %d 小时，累计超标概率 %.4f\n", node_id, longest, total_prob)
+            label = _node_label(case, node_id)
+            @printf("  - %s: 最长连续 %d 小时，累计超标概率 %.4f\n", label, longest, total_prob)
         end
     end
 
@@ -1336,10 +1405,11 @@ function run_mess_dispatch_julia(; case_path::AbstractString=DEFAULT_CASE_XLSX,
         total_prob = get(node_violation_prob, node_id, 0.0)
         compliance_prob = max(0.0, 1.0 - total_prob)
         stats = get(node_violation_breakdown, node_id, nothing)
+        label = _node_label(case, node_id)
         if stats === nothing
-            @printf("  - 节点 %d: 始终满足约束 (概率 %.4f)\n", node_id, 1.0)
+            @printf("  - %s: 始终满足约束 (概率 %.4f)\n", label, 1.0)
         else
-            @printf("  - 节点 %d: 超标概率 %.4f, 满足概率 %.4f\n", node_id, total_prob, compliance_prob)
+            @printf("  - %s: 超标概率 %.4f, 满足概率 %.4f\n", label, total_prob, compliance_prob)
             for duration in sort(collect(keys(stats)))
                 @printf("      · 最长 %d 小时: 场景概率 %.4f\n", duration, stats[duration])
             end
@@ -1353,7 +1423,7 @@ function run_mess_dispatch_julia(; case_path::AbstractString=DEFAULT_CASE_XLSX,
     @printf("期望削减负荷: %.4f kW·h\n", result["expected_load_shed_total"])
     @printf("期望供电率: %.2f%%\n", result["expected_supply_ratio"] * 100)
 
-    _export_mess_report(output_file, result, node_violation_prob, node_violation_breakdown)
+    _export_mess_report(output_file, result, node_violation_prob, node_violation_breakdown, case.node_names)
     println("调度结果已导出到 $(output_file)")
 
     # 返回关键指标供API使用
@@ -1371,6 +1441,7 @@ function run_mess_dispatch_julia(; case_path::AbstractString=DEFAULT_CASE_XLSX,
         total_prob = node_violation_prob[node_id]
         push!(key_metrics["violations"], Dict{String, Any}(
             "node_id" => Int(node_id),
+            "node_name" => _node_name(case, node_id),
             "max_consecutive_hours" => Int(longest),
             "violation_probability" => Float64(total_prob)
         ))
