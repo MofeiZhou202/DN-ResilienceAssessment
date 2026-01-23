@@ -188,6 +188,17 @@ struct HybridGridCase
     mess_transport_initial::Vector{Int}
     node_names::Vector{String}
     mess_names::Vector{String}
+    nstatic::Int
+    static_storage_nodes::Vector{Int}
+    static_storage_charge_max::Vector{Float64}
+    static_storage_discharge_max::Vector{Float64}
+    static_storage_energy_max::Vector{Float64}
+    static_storage_soc_initial::Vector{Float64}
+    static_storage_soc_min::Vector{Float64}
+    static_storage_soc_max::Vector{Float64}
+    static_storage_eta_charge::Vector{Float64}
+    static_storage_eta_discharge::Vector{Float64}
+    static_storage_names::Vector{String}
     Cft_ac_rows::Vector{Vector{Tuple{Int, Float64}}}
     Cft_dc_rows::Vector{Vector{Tuple{Int, Float64}}}
     Cft_vsc_rows::Vector{Vector{Tuple{Int, Float64}}}
@@ -216,9 +227,9 @@ end
 # MESSConfig(name, 接入节点, 最大充电功率, 最大放电功率, 储能容量, 初始SOC, 充电效率%, 放电效率%)
 # 配电网级别：典型移动储能系统容量
 const DEFAULT_MESS = [
-    MESSConfig("MESS-1", 5, 1500.0, 1500.0, 4500.0, 0.0, 92.0, 90.0),   # 1500 kW, 4500 kWh
-    MESSConfig("MESS-2", 10, 1000.0, 1000.0, 4000.0, 0.0, 92.0, 90.0),  # 1000 kW, 4000 kWh
-    MESSConfig("MESS-3", 30, 500.0, 500.0, 3500.0, 0.0, 92.0, 90.0),    # 500 kW, 3500 kWh
+    MESSConfig("MESS-1", 5, 1500.0, 1500.0, 4500.0, 4500.0, 92.0, 90.0),   # 1500 kW, 4500 kWh
+    MESSConfig("MESS-2", 10, 1000.0, 1000.0, 4000.0, 4000.0, 92.0, 90.0),  # 1000 kW, 4000 kWh
+    MESSConfig("MESS-3", 30, 500.0, 500.0, 3500.0, 3500.0, 92.0, 90.0),    # 500 kW, 3500 kWh
 ]
 
 _normalize_label(value) = strip(string(value))
@@ -542,6 +553,48 @@ function load_hybrid_case(case_path::AbstractString, mess_configs::Vector{MESSCo
     transport_node_to_grid_map, transport_grid_to_node_map = _build_transport_mapping(nb)
     mess_transport_initial_nodes = _resolve_mess_transport_initial(copy(mess_nodes), transport_grid_to_node_map)
 
+    static_storage_nodes = Int[]
+    static_storage_charge_max = Float64[]
+    static_storage_discharge_max = Float64[]
+    static_storage_energy_max = Float64[]
+    static_storage_soc_initial = Float64[]
+    static_storage_soc_min = Float64[]
+    static_storage_soc_max = Float64[]
+    static_storage_eta_charge = Float64[]
+    static_storage_eta_discharge = Float64[]
+    static_storage_names = String[]
+
+    for storage in julia_case.storageetap
+        if storage.status != 1
+            continue
+        end
+        node_id = storage.bus_id
+        if node_id < 1 || node_id > nb
+            @warn "静止储能 $(storage.name) 绑定到无效节点 $(node_id)，跳过"
+            continue
+        end
+        push!(static_storage_nodes, node_id)
+        push!(static_storage_energy_max, storage.energy_capacity_kwh)
+        charge_kw = max(storage.power_capacity_mw * 1000.0, 1.0)
+        push!(static_storage_charge_max, charge_kw)
+        push!(static_storage_discharge_max, charge_kw)
+        min_soc = clamp(storage.soc_min * storage.energy_capacity_kwh, 0.0, storage.energy_capacity_kwh)
+        max_soc = clamp(storage.soc_max * storage.energy_capacity_kwh, min_soc, storage.energy_capacity_kwh)
+        push!(static_storage_soc_min, min_soc)
+        push!(static_storage_soc_max, max_soc)
+        soc_init = clamp(storage.soc_init * storage.energy_capacity_kwh, min_soc, max_soc)
+        push!(static_storage_soc_initial, soc_init)
+        eta = clamp(storage.efficiency, 0.1, 1.0)
+        push!(static_storage_eta_charge, eta)
+        push!(static_storage_eta_discharge, eta)
+        display_name = isempty(storage.name) ? "静止储能$(node_id)" : storage.name
+        push!(static_storage_names, display_name)
+    end
+
+    n_static_storage = length(static_storage_nodes)
+    static_capacity_total = round(sum(static_storage_energy_max), digits=1)
+    println("  - 静止储能: $n_static_storage 个, 总能量约 $static_capacity_total kWh")
+
     # 转换矩阵类型为 SparseMatrixCSC{Float64, Int}
     Cft_ac_f = sparse(Float64.(Cft_ac))
     Cft_dc_f = sparse(Float64.(Cft_dc))
@@ -639,6 +692,17 @@ function load_hybrid_case(case_path::AbstractString, mess_configs::Vector{MESSCo
         mess_transport_initial_nodes,
         node_names,
         mess_names,
+        n_static_storage,
+        collect(static_storage_nodes),
+        collect(static_storage_charge_max),
+        collect(static_storage_discharge_max),
+        collect(static_storage_energy_max),
+        collect(static_storage_soc_initial),
+        collect(static_storage_soc_min),
+        collect(static_storage_soc_max),
+        collect(static_storage_eta_charge),
+        collect(static_storage_eta_discharge),
+        static_storage_names,
         _row_entries(Cft_ac_f),
         _row_entries(Cft_dc_f),
         _row_entries(Cft_vsc_f),
@@ -976,6 +1040,9 @@ function optimize_hybrid_dispatch(case::HybridGridCase, statuses, weights::Union
         scenario_soc_vars = Any[]
         scenario_mess_chg_vars = Any[]
         scenario_mess_dis_vars = Any[]
+        scenario_static_charge_vars = Any[]
+        scenario_static_discharge_vars = Any[]
+        scenario_static_soc_vars = Any[]
         scenario_shed_vars = Any[]
         scenario_pg_vars = Any[]
         scenario_pm_vars = Any[]
@@ -991,6 +1058,14 @@ function optimize_hybrid_dispatch(case::HybridGridCase, statuses, weights::Union
                 @constraint(model, soc_init[m_idx] == case.mess_soc_initial[m_idx])
             end
             push!(scenario_soc_vars, soc_init)
+        end
+
+        if case.nstatic > 0
+            static_soc_init = @variable(model, [s=1:case.nstatic], lower_bound=case.static_storage_soc_min[s], upper_bound=case.static_storage_soc_max[s], base_name="static_soc[$(scenario_idx),0]")
+            for s_idx in 1:case.nstatic
+                @constraint(model, static_soc_init[s_idx] == case.static_storage_soc_initial[s_idx])
+            end
+            push!(scenario_static_soc_vars, static_soc_init)
         end
 
         for t in 0:(hours - 1)
@@ -1088,6 +1163,15 @@ function optimize_hybrid_dispatch(case::HybridGridCase, statuses, weights::Union
                 end
             end
 
+            static_charge = nothing
+            static_discharge = nothing
+            if case.nstatic > 0
+                static_charge = @variable(model, [s=1:case.nstatic], lower_bound=0.0, upper_bound=case.static_storage_charge_max[s], base_name="static_chg[$(scenario_idx),$(t)]")
+                static_discharge = @variable(model, [s=1:case.nstatic], lower_bound=0.0, upper_bound=case.static_storage_discharge_max[s], base_name="static_dis[$(scenario_idx),$(t)]")
+                push!(scenario_static_charge_vars, static_charge)
+                push!(scenario_static_discharge_vars, static_discharge)
+            end
+
             shed_var = @variable(model, [node=1:case.nb], lower_bound=0.0, upper_bound=case.load_per_node[node] + 1e-6, base_name="shed[$(scenario_idx),$(t)]")
             push!(scenario_shed_vars, shed_var)
             for node in 1:case.nb
@@ -1165,6 +1249,13 @@ function optimize_hybrid_dispatch(case::HybridGridCase, statuses, weights::Union
                 end
             end
 
+            if case.nstatic > 0 && static_charge !== nothing && static_discharge !== nothing
+                for (s_idx, node_idx) in enumerate(case.static_storage_nodes)
+                    add_to_expression!(node_expr[node_idx], 1.0, static_discharge[s_idx])
+                    add_to_expression!(node_expr[node_idx], -1.0, static_charge[s_idx])
+                end
+            end
+
             for node_idx in 1:case.nb
                 add_to_expression!(node_expr[node_idx], 1.0, shed_var[node_idx])
                 add_to_expression!(node_expr[node_idx], -case.load_per_node[node_idx])
@@ -1181,6 +1272,14 @@ function optimize_hybrid_dispatch(case::HybridGridCase, statuses, weights::Union
                     @constraint(model, next_soc[m_idx] == prev_soc[m_idx] + case.mess_eta_charge[m_idx] * total_charge * TIME_STEP_HOURS - (total_discharge / case.mess_eta_discharge[m_idx]) * TIME_STEP_HOURS - MESS_TRAVEL_ENERGY_LOSS_PER_HOUR * in_transit * TIME_STEP_HOURS)
                 end
                 push!(scenario_soc_vars, next_soc)
+            end
+            if case.nstatic > 0
+                prev_static_soc = scenario_static_soc_vars[end]
+                next_static_soc = @variable(model, [s=1:case.nstatic], lower_bound=case.static_storage_soc_min[s], upper_bound=case.static_storage_soc_max[s], base_name="static_soc[$(scenario_idx),$(t+1)]")
+                for s_idx in 1:case.nstatic
+                    @constraint(model, next_static_soc[s_idx] == prev_static_soc[s_idx] + case.static_storage_eta_charge[s_idx] * static_charge[s_idx] * TIME_STEP_HOURS - (static_discharge[s_idx] / case.static_storage_eta_discharge[s_idx]) * TIME_STEP_HOURS)
+                end
+                push!(scenario_static_soc_vars, next_static_soc)
             end
         end
 
@@ -1215,6 +1314,9 @@ function optimize_hybrid_dispatch(case::HybridGridCase, statuses, weights::Union
             :mobility_schedule => scenario_mobility,
             :mess_chg_vars => scenario_mess_chg_vars,
             :mess_dis_vars => scenario_mess_dis_vars,
+            :static_charge_vars => scenario_static_charge_vars,
+            :static_discharge_vars => scenario_static_discharge_vars,
+            :static_soc_vars => scenario_static_soc_vars,
             :shed_vars => scenario_shed_vars,
             :pg_vars => scenario_pg_vars,
             :pm_vars => scenario_pm_vars,
@@ -1253,6 +1355,11 @@ function optimize_hybrid_dispatch(case::HybridGridCase, statuses, weights::Union
         else
             zeros(Float64, 0)
         end
+        static_soc_terminal = if case.nstatic > 0 && !isempty(record[:static_soc_vars])
+            value.(record[:static_soc_vars][end])
+        else
+            zeros(Float64, 0)
+        end
         mobility_log = String[]
         mess_vectors = Dict{String, Dict{String, Vector}}()
         if case.nmess > 0 && record[:mobility_schedule] !== nothing
@@ -1284,6 +1391,7 @@ function optimize_hybrid_dispatch(case::HybridGridCase, statuses, weights::Union
             "generation_total" => generation_total,
             "microgrid_total" => microgrid_total,
             "mess_soc_terminal" => soc_terminal,
+            "static_storage_soc_terminal" => static_soc_terminal,
             "mobility_log" => mobility_log,
             "mess_vectors" => mess_vectors,
             "served_ratio" => served_ratio,
@@ -1362,6 +1470,17 @@ function run_mess_dispatch_julia(; case_path::AbstractString=DEFAULT_CASE_XLSX,
                         stay_label = _node_label(case, unique_locs[1])
                         println("  → ⚠️ $(mess_name) 未移动，始终在节点 $(stay_label)")
                     end
+                end
+            end
+        end
+
+        if case.nstatic > 0
+            static_terminal = get(detail, "static_storage_soc_terminal", zeros(Float64, 0))
+            if length(static_terminal) == length(case.static_storage_names)
+                println("\n静止储能末端 SOC (kWh):")
+                for (s_idx, storage_name) in enumerate(case.static_storage_names)
+                    node_label = _node_label(case, case.static_storage_nodes[s_idx])
+                    @printf("  - %s @ %s: %.2f kWh\n", storage_name, node_label, static_terminal[s_idx])
                 end
             end
         end

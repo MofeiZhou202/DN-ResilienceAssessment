@@ -2241,6 +2241,7 @@ function load_storages!(case::JuliaPowerCase, file_path::String, sheet_name::Str
             return
         end
         
+        num_ac_buses = length(case.busesAC)
         # 记录处理的行数和错误的行数
         processed_rows = 0
         error_rows = 0
@@ -2265,12 +2266,15 @@ function load_storages!(case::JuliaPowerCase, file_path::String, sheet_name::Str
                 
                 # 使用交流或直流母线映射将名称转换为整数ID
                 bus = 0
+                node_id = 0
                 is_ac_bus = false
 
                 if haskey(case.busdc_name_to_id, bus_name)
                     bus = case.busdc_name_to_id[bus_name]
+                    node_id = bus + num_ac_buses
                 elseif haskey(case.bus_name_to_id, bus_name)
                     bus = case.bus_name_to_id[bus_name]
+                    node_id = bus
                     is_ac_bus = true
                 else
                     @warn "行 $i: 储能设备 $name (ID: $index) 的母线名称 '$bus_name' 在交流/直流母线映射中不存在，跳过此行"
@@ -2278,8 +2282,8 @@ function load_storages!(case::JuliaPowerCase, file_path::String, sheet_name::Str
                     continue
                 end
                 
-                # 验证母线索引是否有效
-                if bus <= 0
+                # 验证上述母线编号和统一编号是否合理
+                if bus <= 0 || node_id <= 0
                     @warn "行 $i: 储能设备 $name (ID: $index) 连接到无效的母线 ($bus)，跳过此行"
                     error_rows += 1
                     continue
@@ -2339,19 +2343,17 @@ function load_storages!(case::JuliaPowerCase, file_path::String, sheet_name::Str
                 type = haskey(row, :type) ? safe_get_value(row[:type], "", String) : ""
                 controllable = haskey(row, :controllable) ? parse_bool(safe_get_value(row[:controllable], true)) : true
                 
-                # 估算储能容量和功率（简化处理）
-                # energy_capacity_kwh = cell * str * package * vpc / 1000 (粗略估计)
-                # power_capacity_mw = energy_capacity_kwh / 1 (假设1小时放电)
-                estimated_energy = cell * str * package * vpc / 1000
-                estimated_power = estimated_energy / 1.0
-                
+                # 默认容量（Excel中没有提供）
+                energy_capacity = 100000.0
+                power_capacity_mw = max(energy_capacity / 1000.0, 0.1)
+
                 # 创建Storageetap对象并添加到case中
                 push!(case.storageetap, Storageetap(
                     index=index,
                     name=name,
-                    bus_id=bus,
-                    energy_capacity_kwh=max(estimated_energy, 100.0),
-                    power_capacity_mw=max(estimated_power, 1.0),
+                    bus_id=node_id,
+                    energy_capacity_kwh=energy_capacity,
+                    power_capacity_mw=power_capacity_mw,
                     soc_init=0.5,
                     soc_min=0.1,
                     soc_max=0.9,
