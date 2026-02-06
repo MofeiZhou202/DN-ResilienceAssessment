@@ -1,0 +1,70 @@
+# Role: Python Scientific Computing Engineer
+# Context: Distribution Network Resilience Assessment - Inference Layer (Layer 4)
+
+请帮我实现一个完整的**配电网弹性推理系统 (ResilienceInferenceSystem)**。
+该系统需要基于蒙特卡洛仿真数据，执行**“统计评估 -> 归因诊断 -> 策略推演”**的三层分析流程。
+
+## 1. 输入数据规范 (Input Data)
+输入数据为合并后的 Pandas DataFrame，包含以下两类：
+
+1.  **特征列 ($X$) - 拓扑状态**：
+    *   列名：`Line_1_Status`, `Line_2_Status`, ... `Line_N_Status`。
+    *   数值：`0` (故障/断开), `1` (正常/闭合)。
+    *   **约束**：仅包含线路物理状态，不包含环境参数。
+
+2.  **目标列 ($Y$) - 仿真结果**：
+    *   **系统指标**：`Total_Load_Loss` (总失负荷量, float), `Supply_Rate` (供电率, 0~1)。
+    *   **节点指标**：`Node_1_Time`, `Node_2_Time`, ... (复电时间, hours)。
+
+## 2. 核心功能需求 (Three-Layer Architecture)
+
+请在类中依次实现以下三个核心模块：
+
+### 模块一：统计评估与代理建模 (Statistics & Surrogate)
+1.  **统计分析**：
+    *   计算系统期望供电率 (EPSR)。
+    *   **节点画像**：计算各节点复电时间 $< 2h$ 的概率。若概率 $< 0.8$，标记为“高风险节点”。
+2.  **代理模型训练**：
+    *   使用 **XGBoost Regressor** 训练映射关系：$f(X_{topology}) \to Y_{loss}$。
+    *   目的：建立拓扑结构与系统损失的快速预测模型。
+
+### 模块二：归因诊断 (Diagnosis via SHAP)
+1.  **计算敏感性梯度**：
+    *   使用 **SHAP (TreeExplainer)** 解释训练好的模型。
+    *   计算每条线路的**全局重要性** (Global Sensitivity)：$S_i = \text{mean}(|\phi_i|)$。
+    *   **输出**：按 $S_i$ 降序排列，识别出 Top 5 关键薄弱线路。
+
+### 模块三：反事实策略生成 (Counterfactual Prescription)
+1.  **策略推演逻辑**：
+    *   针对识别出的 **No.1 薄弱线路**，进行“反事实”模拟。
+    *   **步骤**：
+        1.  选取该线路处于“故障 (0)”状态的样本子集。
+        2.  **干预**：强制将该线路状态修改为“正常 (1)”（模拟加固/修复）。
+        3.  **重预测**：使用代理模型预测修改后的系统损失 $Y_{new}$。
+        4.  **效益评估**：计算平均改善率 $\Delta = \frac{Y_{old} - Y_{new}}{Y_{old}}$。
+    *   **输出**：生成具体的加固建议和预期收益。
+
+## 3. 输出接口定义 (JSON Output)
+
+方法 `run_full_analysis()` 需返回如下 JSON 结构：
+
+```json
+{
+  "statistical_metrics": {
+    "EPSR": 0.94,
+    "high_risk_nodes": [
+      {"node_id": "Node_5", "success_prob_2h": 0.65}
+    ]
+  },
+  "diagnosis_result": {
+    "critical_weak_lines": [
+      {"line_id": "Line_45", "sensitivity_score": 120.5, "rank": 1},
+      {"line_id": "Line_12", "sensitivity_score": 98.2, "rank": 2}
+    ]
+  },
+  "optimization_strategy": {
+    "target_line": "Line_45",
+    "action": "Hardening / Redundancy",
+    "counterfactual_improvement": "18.5%" 
+  }
+}

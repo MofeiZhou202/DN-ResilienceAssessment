@@ -853,6 +853,11 @@ def run_cluster_workflow(args: argparse.Namespace) -> List[Path]:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     results: List[Path] = []
+    # 尝试获取linefailprob路径（用于保存原始故障概率）
+    linefail_path = getattr(args, 'linefail_path', None)
+    if linefail_path:
+        linefail_path = Path(linefail_path)
+    
     for workbook in workbooks:
         try:
             rel_display = workbook.relative_to(base_dir)
@@ -867,6 +872,7 @@ def run_cluster_workflow(args: argparse.Namespace) -> List[Path]:
             args.coverage_targets,
             args.coverage_thresholds,
             output_dir=output_dir,
+            linefail_path=linefail_path,
         )
         results.append(output_path)
     return results
@@ -1022,6 +1028,7 @@ def run_auto_evaluation(args: argparse.Namespace) -> dict[str, object]:
         output_dir=str(cluster_dir),
         workbooks=None,
         limit=None,
+        linefail_path=str(linefail_path),  # 传递原始故障概率文件路径
     )
     cluster_outputs = run_cluster_workflow(cluster_args)
     if not cluster_outputs:

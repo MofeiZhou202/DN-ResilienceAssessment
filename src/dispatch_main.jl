@@ -97,10 +97,68 @@ function _export_mess_report(output_path::AbstractString, result::Dict{String, A
         DataFrame(rows)
     end
 
+    # 导出每个场景的详细弹性指标（供推理层使用）
+    scenario_details_df = _export_scenario_details(result)
+    
+    # 导出每小时详细数据（100场景×48小时=4800行，供推理层使用）
+    hourly_details_df = _export_hourly_details(result)
+
     XLSX.openxlsx(output_path, mode = "w") do workbook
         _write_df_sheet!(workbook, "Summary", summary_df)
         _write_df_sheet!(workbook, "NoPowerViolations", violation_df)
+        _write_df_sheet!(workbook, "ScenarioDetails", scenario_details_df)
+        _write_df_sheet!(workbook, "HourlyDetails", hourly_details_df)
     end
+end
+
+# 新增：导出每个场景的详细弹性指标
+function _export_scenario_details(result::Dict{String, Any})
+    scenario_results = get(result, "scenario_results", [])
+    if isempty(scenario_results)
+        return DataFrame(信息 = ["无场景详细数据"])
+    end
+    
+    rows = NamedTuple[]
+    for (idx, detail) in enumerate(scenario_results)
+        push!(rows, (
+            Scenario_ID = idx,
+            Probability = round(get(detail, "probability", 0.0), digits=6),
+            Load_Demand_Total = round(get(detail, "load_demand_total", 0.0), digits=4),
+            Load_Shed_Total = round(get(detail, "load_shed_total", 0.0), digits=4),
+            Supply_Rate = round(get(detail, "served_ratio", 0.0), digits=6),
+            Generation_Total = round(get(detail, "generation_total", 0.0), digits=4),
+            Microgrid_Total = round(get(detail, "microgrid_total", 0.0), digits=4),
+            Objective = round(get(detail, "objective", 0.0), digits=4),
+        ))
+    end
+    return DataFrame(rows)
+end
+
+# 新增：导出每小时详细数据（供推理层使用，100场景×48小时=4800行）
+function _export_hourly_details(result::Dict{String, Any})
+    hourly_details = get(result, "hourly_details", [])
+    if isempty(hourly_details)
+        return DataFrame(信息 = ["无每小时详细数据"])
+    end
+    
+    rows = NamedTuple[]
+    for detail in hourly_details
+        push!(rows, (
+            Scenario_ID = get(detail, "scenario_id", 0),
+            TimeStep = get(detail, "time_step", 0),
+            Probability = round(get(detail, "probability", 0.0), digits=6),
+            Load_Demand = round(get(detail, "load_demand", 0.0), digits=4),
+            Load_Shed = round(get(detail, "load_shed", 0.0), digits=4),
+            Supply_Rate = round(get(detail, "supply_rate", 0.0), digits=6),
+            Generation = round(get(detail, "generation", 0.0), digits=4),
+            Microgrid = round(get(detail, "microgrid", 0.0), digits=4),
+            VSC_Power = round(get(detail, "vsc_power", 0.0), digits=4),
+            Nodes_No_Power = get(detail, "nodes_no_power", 0),
+            Nodes_Over_2h = get(detail, "nodes_over_2h", 0),
+            Nodes_Over_3h = get(detail, "nodes_over_3h", 0),
+        ))
+    end
+    return DataFrame(rows)
 end
 
 struct TrafficArc
@@ -708,12 +766,12 @@ function load_hybrid_case(case_path::AbstractString, mess_configs::Vector{MESSCo
         _row_entries(Cft_vsc_f),
     )
 
-    println("HybridGridCase 构建完成:")
-    println("  - 节点: AC=$nb_ac, DC=$nb_dc, 总计=$nb")
-    println("  - 线路: AC=$nl_ac, DC=$nl_dc, VSC=$nl_vsc")
-    println("  - 发电机: $ng, 微网: $nmg, MESS: $(length(mess_nodes))")
-    println("  - 总负荷: $(round(sum(Pd), digits=1)) kW")
-    println("  - 微网总容量: $(round(sum(Pmgmax), digits=1)) kW")
+    # println("HybridGridCase 构建完成:")
+    # println("  - 节点: AC=$nb_ac, DC=$nb_dc, 总计=$nb")
+    # println("  - 线路: AC=$nl_ac, DC=$nl_dc, VSC=$nl_vsc")
+    # println("  - 发电机: $ng, 微网: $nmg, MESS: $(length(mess_nodes))")
+    # println("  - 总负荷: $(round(sum(Pd), digits=1)) kW")
+    # println("  - 微网总容量: $(round(sum(Pmgmax), digits=1)) kW")
 
     return case
 end
@@ -1403,11 +1461,84 @@ function optimize_hybrid_dispatch(case::HybridGridCase, statuses, weights::Union
     expected_load_shed = sum(detail["probability"] * detail["load_shed_total"] for detail in scenario_results)
     expected_supply_ratio = sum(detail["probability"] * detail["served_ratio"] for detail in scenario_results)
 
+    # 收集每小时详细数据 (供推理层使用)
+    hourly_details = Vector{Dict{String, Any}}()
+    load_per_hour = sum(case.load_per_node)  # 每小时总负荷需求
+    for (scenario_idx, record) in enumerate(scenario_records)
+        hours_count = record[:hours]
+        scenario_weight = record[:weight]
+        
+        # 收集每个时间步的节点断电状态（用于计算连续断电）
+        no_power_matrix = zeros(Int, hours_count, case.nb)  # hours × nodes
+        if haskey(record, :no_power_vars) && !isempty(record[:no_power_vars])
+            for t in 1:hours_count
+                for node in 1:case.nb
+                    if value(record[:no_power_vars][t][node]) > 0.5
+                        no_power_matrix[t, node] = 1
+                    end
+                end
+            end
+        end
+        
+        # 计算到当前时刻为止的连续断电时间（滑动窗口）
+        consecutive_no_power = zeros(Int, hours_count, case.nb)
+        for node in 1:case.nb
+            count = 0
+            for t in 1:hours_count
+                if no_power_matrix[t, node] == 1
+                    count += 1
+                else
+                    count = 0
+                end
+                consecutive_no_power[t, node] = count
+            end
+        end
+        
+        for t in 1:hours_count
+            # 当前时间步的失负荷量
+            shed_t = sum(value.(record[:shed_vars][t]))
+            # 当前时间步的发电量
+            gen_t = isempty(record[:pg_vars]) ? 0.0 : sum(value.(record[:pg_vars][t]))
+            # 当前时间步的微网出力
+            mg_t = isempty(record[:pm_vars]) ? 0.0 : sum(value.(record[:pm_vars][t]))
+            # VSC功率
+            prec_t = isempty(record[:prec_vars]) ? 0.0 : sum(value.(record[:prec_vars][t]))
+            pinv_t = isempty(record[:pinv_vars]) ? 0.0 : sum(value.(record[:pinv_vars][t]))
+            
+            # 计算当前时间步的供电率
+            served_t = load_per_hour - shed_t
+            supply_rate_t = load_per_hour > 0 ? served_t / load_per_hour : 1.0
+            
+            # 当前时刻断电的节点数
+            nodes_no_power = sum(no_power_matrix[t, :])
+            # 当前时刻连续断电超过2小时的节点数
+            nodes_over_2h = sum(consecutive_no_power[t, :] .>= 2)
+            # 当前时刻连续断电超过3小时的节点数
+            nodes_over_3h = sum(consecutive_no_power[t, :] .>= 3)
+            
+            push!(hourly_details, Dict(
+                "scenario_id" => scenario_idx,
+                "time_step" => t,
+                "probability" => scenario_weight,
+                "load_demand" => load_per_hour,
+                "load_shed" => shed_t,
+                "supply_rate" => supply_rate_t,
+                "generation" => gen_t,
+                "microgrid" => mg_t,
+                "vsc_power" => prec_t + pinv_t,
+                "nodes_no_power" => nodes_no_power,
+                "nodes_over_2h" => nodes_over_2h,
+                "nodes_over_3h" => nodes_over_3h,
+            ))
+        end
+    end
+
     result = Dict(
         "objective" => objective_value(model),
         "expected_load_shed_total" => expected_load_shed,
         "expected_supply_ratio" => expected_supply_ratio,
         "scenario_results" => scenario_results,
+        "hourly_details" => hourly_details,
     )
 
     return model, result
@@ -1439,36 +1570,36 @@ function run_mess_dispatch_julia(; case_path::AbstractString=DEFAULT_CASE_XLSX,
     for (idx, detail) in enumerate(scenario_details)
         label = idx <= length(labels) ? labels[idx] : "Scenario $(idx)"
         prob = detail["probability"]
-        println("\n" * "="^60)
-        println("场景 $(idx)/$(total_scenarios) ($(label))")
-        println("="^60)
-        @printf("场景概率: %.4f\n", prob)
-        @printf("调度模型目标值: %.4f\n", detail["objective"])
-        @printf("总负荷需求: %.4f kW·h\n", detail["load_demand_total"])
-        @printf("削减负荷: %.4f kW·h (供电率 %.2f%%)\n", detail["load_shed_total"], detail["served_ratio"] * 100)
+        # println("\n" * "="^60)
+        # println("场景 $(idx)/$(total_scenarios) ($(label))")
+        # println("="^60)
+        # @printf("场景概率: %.4f\n", prob)
+        # @printf("调度模型目标值: %.4f\n", detail["objective"])
+        # @printf("总负荷需求: %.4f kW·h\n", detail["load_demand_total"])
+        # @printf("削减负荷: %.4f kW·h (供电率 %.2f%%)\n", detail["load_shed_total"], detail["served_ratio"] * 100)
 
         if case.nmess > 0
             soc_terminal = detail["mess_soc_terminal"]
             soc_text = join([@sprintf("%.2f", val) for val in soc_terminal], ", ")
-            println("MESS 末端 SOC: [$(soc_text)] kW·h")
-            println("\n--- MESS 向量化结果 ($(hours)时段) ---")
+            # println("MESS 末端 SOC: [$(soc_text)] kW·h")
+            # println("\n--- MESS 向量化结果 ($(hours)时段) ---")
             mess_vectors = detail["mess_vectors"]
             for (mess_name, vectors) in mess_vectors
                 location = vectors["location"]
                 power = vectors["power"]
-                println()
-                println("$(mess_name) Location: $(location)")
-                println("$(mess_name) Power (kW): $(power)")
+                # println()
+                # println("$(mess_name) Location: $(location)")
+                # println("$(mess_name) Power (kW): $(power)")
                 unique_locs = sort(unique(filter(x -> x > 0, location)))
                 if length(unique_locs) > 1
                     visited = [ _node_label(case, loc) for loc in unique_locs ]
-                    println("  → ✅ $(mess_name) 发生了移动! 访问了节点: $(join(visited, ", "))")
+                    # println("  → ✅ $(mess_name) 发生了移动! 访问了节点: $(join(visited, ", "))")
                 else
                     if isempty(unique_locs)
-                        println("  → ⚠️ $(mess_name) 未能确定停留节点")
+                        # println("  → ⚠️ $(mess_name) 未能确定停留节点")
                     else
                         stay_label = _node_label(case, unique_locs[1])
-                        println("  → ⚠️ $(mess_name) 未移动，始终在节点 $(stay_label)")
+                        # println("  → ⚠️ $(mess_name) 未移动，始终在节点 $(stay_label)")
                     end
                 end
             end
@@ -1477,10 +1608,10 @@ function run_mess_dispatch_julia(; case_path::AbstractString=DEFAULT_CASE_XLSX,
         if case.nstatic > 0
             static_terminal = get(detail, "static_storage_soc_terminal", zeros(Float64, 0))
             if length(static_terminal) == length(case.static_storage_names)
-                println("\n静止储能末端 SOC (kWh):")
+                # println("\n静止储能末端 SOC (kWh):")
                 for (s_idx, storage_name) in enumerate(case.static_storage_names)
                     node_label = _node_label(case, case.static_storage_nodes[s_idx])
-                    @printf("  - %s @ %s: %.2f kWh\n", storage_name, node_label, static_terminal[s_idx])
+                    # @printf("  - %s @ %s: %.2f kWh\n", storage_name, node_label, static_terminal[s_idx])
                 end
             end
         end

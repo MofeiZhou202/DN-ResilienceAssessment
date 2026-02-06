@@ -5,6 +5,53 @@ import os
 import numpy as np
 import pandas as pd
 
+MONOTONIC_ABS_TOL = 5e-5
+MONOTONIC_REL_TOL = 0.01
+
+
+def _is_prob_column(column: object) -> bool:
+    if not isinstance(column, str):
+        return False
+    key = column.strip().lower()
+    return key.startswith("hour_") or key.startswith("col_") or key.startswith("timestep")
+
+
+def _convert_linefailprob_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    """Ensure the dataframe stores per-hour independent failure probabilities."""
+
+    prob_cols = [col for col in df.columns if _is_prob_column(col)]
+    if not prob_cols:
+        return df
+
+    result = df.copy()
+    values = result[prob_cols].to_numpy(dtype=float)
+    if values.size == 0:
+        return result
+
+    safe_values = np.nan_to_num(values, nan=0.0)
+    diffs = np.diff(safe_values, axis=1)
+    row_range = safe_values.max(axis=1) - safe_values.min(axis=1)
+    row_tolerance = np.maximum(
+        MONOTONIC_ABS_TOL, MONOTONIC_REL_TOL * np.maximum(row_range, 1e-6)
+    )
+    monotonic_mask = np.all(diffs >= -row_tolerance[:, None], axis=1)
+    if not np.any(monotonic_mask):
+        return result
+
+    converted = values.copy()
+    prev_cum = np.zeros(values.shape[0], dtype=float)
+    for col_idx in range(values.shape[1]):
+        curr = np.clip(values[:, col_idx], 0.0, 0.999999)
+        incremental = np.maximum(curr - prev_cum, 0.0)
+        denom = np.maximum(1.0 - prev_cum, 1e-9)
+        hazard = np.where(prev_cum >= 0.999999, 0.0, incremental / denom)
+        hazard = np.clip(hazard, 0.0, 1.0)
+        converted[:, col_idx] = np.where(monotonic_mask, hazard, curr)
+        prev_cum = np.where(monotonic_mask, curr, prev_cum)
+
+    result.loc[:, prob_cols] = converted
+    return result
+
 
 class PseudoMCSampling:
     def __init__(self, linefailprob, wind_farms_output, random_failure_prob, options):
@@ -55,6 +102,7 @@ class PseudoMCSampling:
             index_col=line_index_col,
             engine="openpyxl",
         )
+        linefail_df = _convert_linefailprob_dataframe(linefail_df)
         wind_df = pd.read_excel(
             wind_output_path,
             sheet_name=sheet_name,

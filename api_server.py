@@ -9,6 +9,8 @@ matplotlib.use('Agg')
 
 import shlex
 import re
+import shutil
+import subprocess
 import sys
 import uuid
 import tempfile
@@ -29,6 +31,55 @@ if Path(sys.executable).resolve() != _VENV_PYTHON.resolve():
 sys.stdout.reconfigure(line_buffering=True)
 sys.stderr.reconfigure(line_buffering=True)
 os.environ['PYTHONUNBUFFERED'] = '1'
+
+
+def _ensure_julia_dll_search_path() -> None:
+    """确保能够找到 Julia 打包的 DLL（如 libamd.dll）。"""
+
+    def _probe_bindir(executable: Path) -> Optional[Path]:
+        try:
+            output = subprocess.check_output(
+                [str(executable), "--startup-file=no", "-e", "print(Sys.BINDIR)"],
+                timeout=30,
+                text=True,
+            ).strip()
+            candidate = Path(output)
+            if candidate.is_dir():
+                return candidate
+        except Exception:
+            resolved = executable.resolve().parent
+            if resolved.is_dir():
+                return resolved
+        return None
+
+    candidate = os.environ.get("JULIA_BINDIR")
+    path_obj = Path(candidate) if candidate else None
+    if not path_obj or not path_obj.is_dir():
+        julia_exe = shutil.which("julia")
+        path_obj = _probe_bindir(Path(julia_exe)) if julia_exe else None
+    if not path_obj or not path_obj.is_dir():
+        juliaup_root = Path.home() / ".julia" / "juliaup"
+        for option in juliaup_root.glob("julia-*/bin"):
+            if option.is_dir():
+                path_obj = option.resolve()
+                break
+    if not path_obj or not path_obj.is_dir():
+        return
+
+    bindir = str(path_obj)
+    os.environ["JULIA_BINDIR"] = bindir
+    if hasattr(os, "add_dll_directory"):
+        try:
+            os.add_dll_directory(bindir)
+        except OSError:
+            pass
+    existing_path = os.environ.get("PATH", "")
+    path_entries = existing_path.split(os.pathsep) if existing_path else []
+    if bindir not in path_entries:
+        os.environ["PATH"] = bindir if not existing_path else f"{bindir}{os.pathsep}{existing_path}"
+
+
+_ensure_julia_dll_search_path()
 
 from flask import Flask, jsonify, request
 
@@ -1124,6 +1175,176 @@ def resilience_assessment_route():
             "status": "error",
             "message": f"弹性评估流程执行失败: {str(exc)}",
             "error_detail": error_detail,
+        }), 500
+
+
+# ==================== 推理层 API ====================
+
+@app.route("/api/inference/analyze", methods=["POST"])
+def api_inference_analyze():
+    """
+    推理层API: 执行配电网弹性推理分析
+    
+    基于蒙特卡洛仿真数据，执行"统计评估 -> 归因诊断 -> 策略推演"的三层分析流程。
+    
+    请求体参数:
+        data_file (str): 输入数据文件路径（Excel/CSV），可以是本地路径或URL
+        output_format (str, optional): 输出格式 "json" | "markdown"，默认 "json"
+        top_n_diagnosis (int, optional): 诊断时识别的Top N薄弱线路数量，默认5
+        top_n_prescriptions (int, optional): 生成策略建议的数量，默认3
+        line_prefix (str, optional): 线路状态列前缀，默认 "Line_"
+        line_suffix (str, optional): 线路状态列后缀，默认 "_Status"
+        target_column (str, optional): 目标列名，默认 "Total_Load_Loss"
+        
+    返回:
+        成功时返回推理分析报告
+        失败时返回错误信息
+    """
+    try:
+        # 导入推理模块
+        from src.inference import ResilienceInferenceSystem
+        
+        payload = _extract_payload()
+        
+        # 获取输入文件路径
+        data_file = _normalize_path(payload.get("data_file"))
+        if not data_file:
+            return jsonify({
+                "status": "error",
+                "message": "缺少必需参数: data_file"
+            }), 400
+        
+        data_path = Path(data_file)
+        if not data_path.exists():
+            return jsonify({
+                "status": "error",
+                "message": f"数据文件不存在: {data_file}"
+            }), 400
+        
+        # 获取可选参数
+        output_format = payload.get("output_format", "json")
+        top_n_diagnosis = int(payload.get("top_n_diagnosis", 5))
+        top_n_prescriptions = int(payload.get("top_n_prescriptions", 3))
+        line_prefix = payload.get("line_prefix", "Line_")
+        line_suffix = payload.get("line_suffix", "_Status")
+        target_column = payload.get("target_column", "Total_Load_Loss")
+        supply_rate_column = payload.get("supply_rate_column", "Supply_Rate")
+        
+        print(f"[inference] 开始推理分析: {data_file}")
+        
+        # 加载数据并创建推理系统
+        if str(data_path).endswith('.csv'):
+            system = ResilienceInferenceSystem.from_csv(
+                str(data_path),
+                line_prefix=line_prefix,
+                line_suffix=line_suffix,
+                target_column=target_column,
+                supply_rate_column=supply_rate_column,
+            )
+        else:
+            system = ResilienceInferenceSystem.from_excel(
+                str(data_path),
+                line_prefix=line_prefix,
+                line_suffix=line_suffix,
+                target_column=target_column,
+                supply_rate_column=supply_rate_column,
+            )
+        
+        # 执行推理分析
+        report = system.run_full_inference(
+            top_n_diagnosis=top_n_diagnosis,
+            top_n_prescriptions=top_n_prescriptions,
+        )
+        
+        print(f"[inference] 分析完成")
+        
+        # 根据输出格式返回结果
+        if output_format == "markdown":
+            return jsonify({
+                "status": "success",
+                "format": "markdown",
+                "report": report.to_markdown(),
+            })
+        else:
+            return jsonify({
+                "status": "success",
+                "format": "json",
+                "report": report.to_dict(),
+            })
+            
+    except ImportError as e:
+        return jsonify({
+            "status": "error",
+            "message": f"推理模块依赖缺失: {str(e)}。请运行: pip install xgboost shap",
+        }), 500
+    except Exception as exc:
+        import traceback
+        error_detail = traceback.format_exc()
+        print(f"[inference] 错误: {error_detail}")
+        return jsonify({
+            "status": "error",
+            "message": f"推理分析失败: {str(exc)}",
+            "error_detail": error_detail,
+        }), 500
+
+
+@app.route("/api/inference/quick-stats", methods=["POST"])
+def api_inference_quick_stats():
+    """
+    推理层API: 快速统计分析（仅执行统计评估模块）
+    
+    请求体参数:
+        data_file (str): 输入数据文件路径
+        
+    返回:
+        统计评估结果
+    """
+    try:
+        from src.inference import ResilienceInferenceSystem
+        
+        payload = _extract_payload()
+        data_file = _normalize_path(payload.get("data_file"))
+        
+        if not data_file:
+            return jsonify({
+                "status": "error",
+                "message": "缺少必需参数: data_file"
+            }), 400
+        
+        data_path = Path(data_file)
+        if not data_path.exists():
+            return jsonify({
+                "status": "error",
+                "message": f"数据文件不存在: {data_file}"
+            }), 400
+        
+        # 加载数据
+        if str(data_path).endswith('.csv'):
+            system = ResilienceInferenceSystem.from_csv(str(data_path))
+        else:
+            system = ResilienceInferenceSystem.from_excel(str(data_path))
+        
+        # 仅执行统计分析
+        stats = system.compute_statistics()
+        
+        return jsonify({
+            "status": "success",
+            "statistics": {
+                "epsr": stats.epsr,
+                "mean_load_loss": stats.mean_load_loss,
+                "std_load_loss": stats.std_load_loss,
+                "high_risk_nodes": stats.high_risk_nodes,
+                "node_risk_profile": stats.node_risk_profile,
+                "sample_count": stats.sample_count,
+            }
+        })
+        
+    except Exception as exc:
+        import traceback
+        return jsonify({
+            "status": "error",
+            "message": f"统计分析失败: {str(exc)}",
+            "error_detail": traceback.format_exc(),
         }), 500
 
 
