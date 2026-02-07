@@ -1081,7 +1081,7 @@ function optimize_hybrid_dispatch(case::HybridGridCase, statuses, weights::Union
     model = Model(Gurobi.Optimizer)
     set_optimizer_attribute(model, "OutputFlag", 1)
     set_optimizer_attribute(model, "LogToConsole", 1)
-    set_optimizer_attribute(model, "TimeLimit",450)
+    set_optimizer_attribute(model, "TimeLimit", 400)
     set_optimizer_attribute(model, "MIPGap", 0.01)
 
     objective_expr = JuMP.AffExpr(0.0)

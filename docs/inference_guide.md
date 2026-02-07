@@ -1,341 +1,176 @@
-# 配电网弹性推理层使用指南
+# 推理层使用指南
 
-## 一、概述
+## 快速开始
 
-推理层是规划方案仿真验证智能体的第四层，负责基于蒙特卡洛仿真数据执行**"统计评估 → 归因诊断 → 策略推演"**的三层分析流程。
+### 前提条件
 
-### 架构位置
+1. Python 3.10+，已安装依赖：
+   ```bash
+   pip install -r requirements.txt
+   ```
+   核心依赖：`pandas`, `numpy`, `networkx`, `xgboost`, `openpyxl`
 
-```
-用户交互层 (Coze)
-      ↓
-认知层 (豆包大模型)
-      ↓
-计算层 (api_server.py - DN-RESILIENCE) ← 计算每个场景的弹性指标
-      ↓
-推理层 (ResilienceInferenceSystem) ← 基于弹性指标进行归因和推演
-```
+2. 数据文件就位（在 `data/` 目录下）：
+   - `ac_dc_real_case.xlsx` — 配电网拓扑数据（母线、线路、负荷、VSC、DC）
+   - `topology_reconfiguration_results.xlsx` — Julia拓扑重构结果（100场景×48时间步×35线路状态）
+   - `mess_dispatch_hourly.xlsx` — Julia MESS调度结果（失负荷、供电率等弹性指标）
+   - `inference_baseline_real.json` — Julia基线统计（期望失负荷、超时节点等）
 
-### ⚠️ 重要：推理层的数据来源
-
-**推理层不直接计算潮流或弹性指标！** 它的工作原理是：
-
-1. **数据来源**：从计算层（弹性评估）获取每个场景的：
-   - 线路状态（0=故障, 1=正常）
-   - 弹性指标（失负荷量、供电率等）
-
-2. **推理机制**：
-   - 建立"线路状态 → 弹性指标"的映射关系（使用XGBoost代理模型）
-   - 使用SHAP分析每条线路对弹性的影响
-   - 通过反事实推理模拟加固效果
-
-**如果缺少场景级别的弹性指标数据，推理结果将不准确！**
-
-### 核心功能
-
-1. **统计评估与代理建模**：计算EPSR、识别高风险节点、训练XGBoost代理模型
-2. **SHAP归因诊断**：识别关键薄弱线路，量化各线路对系统弹性的影响
-3. **反事实策略生成**：模拟加固效果，给出具体的改进建议和预期收益
+3. （可选）Julia + Gurobi — 仅在需要"Julia真实验证"时才需要
 
 ---
 
-## 二、完整工作流程
+## 两种运行方式
 
-### 正确的流程（需要完整弹性评估数据）
+### 方式一：35条线路全排序（推荐）
 
 ```bash
-# Step 1: 运行弹性评估生成场景数据
-python api_server.py
-# 调用 /api/resilience-assessment API
+# 仅预测排序，不跑Julia验证（约2分钟）
+python run_ranking_validation.py --predict-only
 
-# Step 2: 运行推理分析
-python run_inference_pipeline_v2.py
+# 预测排序 + 验证Top10（约2小时）
+python run_ranking_validation.py
+
+# 只验证Top5
+python run_ranking_validation.py --top 5
 ```
 
-### 快速测试流程（使用现有数据估算）
+**输出**：
+- `output/line_ranking_report.md` — Markdown排序报告
+- `output/line_ranking_report.json` — JSON格式完整数据
 
-如果你只想快速了解推理功能，可以使用简化版本：
+**示例输出**：
+```
+  排名 线路         综合改善    失负荷    超时改善  关键
+  ────────────────────────────────────────────────────
+     1 AC_Line_20    8.92%    10.23%     6.95%   ★ ◄
+     2 AC_Line_6     7.45%     8.12%     6.44%   ★ ◄
+     3 DC_Line_1     5.21%     4.89%     5.69%      ◄
+   ...
+    35 VSC_Line_4    0.00%     0.00%     0.00%
+```
+
+### 方式二：指定线路验证
 
 ```bash
-python run_inference_pipeline.py
-```
+# 单条线路预测
+python validate_inference.py --lines AC_Line_19 --predict-only
 
-⚠️ **注意**：简化版本使用优化目标值（Objective）作为弹性指标的代理，结果是估算值，不是真实的潮流计算结果。
+# 单条线路预测 + Julia验证
+python validate_inference.py --lines AC_Line_19
 
----
+# 多条线路逐个测试
+python validate_inference.py --lines AC_Line_19 AC_Line_6 DC_Line_1
 
-## 三、安装依赖
+# 多条线路同时加固（组合效应）
+python validate_inference.py --lines AC_Line_19 AC_Line_6 --multi
 
-```bash
-# 安装推理层额外依赖
-pip install xgboost shap
+# 逐个 + 组合都测
+python validate_inference.py --lines AC_Line_19 AC_Line_6 --both
 
-# 或安装全部依赖
-pip install -r requirements.txt
-```
+# 批量测试（逐个 + 两两 + 全部）
+python validate_inference.py --batch --lines AC_Line_19 AC_Line_6 AC_Line_16
 
----
-
-## 三、数据格式要求
-
-### 输入数据规范
-
-推理层接受包含以下列的 DataFrame/Excel/CSV 文件：
-
-#### 1. 特征列（线路状态）
-
-| 列名格式 | 说明 | 取值 |
-|---------|------|-----|
-| `Line_1_Status`, `Line_2_Status`, ... | 线路物理状态 | `0`=故障/断开, `1`=正常/闭合 |
-
-#### 2. 目标列（仿真结果）
-
-| 列名 | 说明 | 取值范围 |
-|------|------|---------|
-| `Total_Load_Loss` | 总失负荷量 | float ≥ 0 |
-| `Supply_Rate` | 供电率 | 0~1 |
-| `Node_1_Time`, `Node_2_Time`, ... | 节点复电时间 | float (小时) |
-
-### 示例数据
-
-```
-Line_1_Status | Line_2_Status | Line_3_Status | Total_Load_Loss | Supply_Rate | Node_1_Time | Node_2_Time
-       1      |       1       |       0       |      2.5        |    0.95     |     0.5     |     1.2
-       0      |       1       |       1       |      5.8        |    0.88     |     2.1     |     0.8
-       1      |       0       |       0       |      8.2        |    0.83     |     3.5     |     2.9
-       ...
+# 只做预测不跑Julia
+python validate_inference.py --lines AC_Line_19 AC_Line_6 --predict-only
 ```
 
 ---
 
-## 四、使用方法
+## 线路命名规范
 
-### 方法1：Python代码调用
+| 类型 | 命名格式 | 编号范围 | MC故障矩阵行号 |
+|------|---------|---------|---------------|
+| AC线路 | `AC_Line_1` ~ `AC_Line_26` | 1-26 | 1-26 |
+| DC线路 | `DC_Line_1` ~ `DC_Line_2` | 1-2 | 27-28 |
+| VSC换流器 | `VSC_Line_1` ~ `VSC_Line_7` | 1-7 | 29-35 |
 
-```python
-# 导入模块
-from src.inference import ResilienceInferenceSystem, analyze_resilience
-
-# 方式A：使用类（完全控制）
-system = ResilienceInferenceSystem.from_excel("data/mc_results.xlsx")
-report = system.run_full_inference(
-    top_n_diagnosis=5,      # 识别Top 5薄弱线路
-    top_n_prescriptions=3,  # 生成3条加固建议
-)
-
-# 输出Markdown报告
-print(report.to_markdown())
-
-# 获取JSON格式结果
-result_dict = report.to_dict()
-
-# 方式B：使用便捷函数（一行代码）
-report = analyze_resilience(
-    data="data/mc_results.xlsx",
-    output_file="output/report.md"  # 可选，自动保存报告
-)
-```
-
-### 方法2：API接口调用
-
-启动API服务后，可通过HTTP接口调用推理层：
-
-```bash
-# 启动API服务
-python api_server.py
-```
-
-#### 完整推理分析
-
-```bash
-curl -X POST http://localhost:5000/api/inference/analyze \
-  -H "Content-Type: application/json" \
-  -d '{
-    "data_file": "D:/path/to/mc_results.xlsx",
-    "output_format": "json",
-    "top_n_diagnosis": 5,
-    "top_n_prescriptions": 3
-  }'
-```
-
-#### 快速统计分析
-
-```bash
-curl -X POST http://localhost:5000/api/inference/quick-stats \
-  -H "Content-Type: application/json" \
-  -d '{
-    "data_file": "D:/path/to/mc_results.xlsx"
-  }'
-```
-
-### 方法3：运行演示脚本
-
-```bash
-python inference_demo.py
-```
+常开线路（联络开关）：AC_Line_24, AC_Line_25, AC_Line_26, VSC_Line_1, VSC_Line_3
 
 ---
 
-## 五、输出结果说明
-
-### 1. 统计评估结果
-
-```json
-{
-  "epsr": 0.9234,           // 期望供电率 (Expected Power Supply Rate)
-  "mean_load_loss": 3.45,   // 平均失负荷量
-  "std_load_loss": 1.23,    // 失负荷标准差
-  "high_risk_nodes": ["Node_5", "Node_12"],  // 高风险节点列表
-  "sample_count": 500       // 分析样本数
-}
-```
-
-### 2. 归因诊断结果
-
-```json
-{
-  "top_vulnerable_lines": ["Line_7", "Line_3", "Line_15", "Line_2", "Line_9"],
-  "global_sensitivity": [
-    {"line": "Line_7", "sensitivity": 0.523},
-    {"line": "Line_3", "sensitivity": 0.412},
-    ...
-  ]
-}
-```
-
-### 3. 策略推演结果
-
-```json
-{
-  "prescriptions": [
-    {
-      "target_line": "Line_7",
-      "affected_samples": 87,
-      "original_loss_mean": 6.82,
-      "counterfactual_loss_mean": 3.15,
-      "improvement_rate": 0.538,
-      "expected_benefit": 3.67,
-      "recommendation": "强烈建议加固Line_7。预计可减少平均失负荷53.8%，收益显著。"
-    }
-  ]
-}
-```
-
----
-
-## 六、与Coze集成
-
-### 在Coze中调用推理层
-
-1. 在Coze中配置API插件，指向 `http://your-server:5000`
-2. 创建工作流，在需要分析的节点调用 `/api/inference/analyze`
-3. 将返回的报告传递给豆包大模型进行自然语言解读
-
-### 示例Coze工作流
-
-```
-用户请求: "分析刚才仿真结果的弹性水平"
-     ↓
-认知层(豆包): 识别意图，调用推理API
-     ↓
-计算层: 执行推理分析
-     ↓
-推理层返回: JSON/Markdown报告
-     ↓
-认知层(豆包): 解读报告，生成用户友好的回复
-     ↓
-回复用户: "分析结果显示，系统期望供电率为92.34%...建议优先加固Line_7..."
-```
-
----
-
-## 七、高级配置
-
-### 自定义列名识别
-
-```python
-system = ResilienceInferenceSystem(
-    data=df,
-    line_prefix="Branch_",        # 自定义线路列前缀
-    line_suffix="_State",         # 自定义线路列后缀
-    node_time_prefix="Bus_",      # 自定义节点列前缀
-    node_time_suffix="_Recovery", # 自定义节点列后缀
-    target_column="LoadShed",     # 自定义目标列名
-    high_risk_threshold=0.85,     # 自定义高风险阈值
-    recovery_time_threshold=3.0,  # 自定义复电时间阈值(小时)
-)
-```
-
-### 调整代理模型参数
-
-```python
-report = system.run_full_inference(
-    n_estimators=200,    # XGBoost树的数量
-    max_depth=8,         # 树的最大深度
-    learning_rate=0.05,  # 学习率
-)
-```
-
----
-
-## 八、文件结构
+## 文件结构
 
 ```
 DN-ResilienceAssessment/
-├── src/
-│   └── inference/
-│       ├── __init__.py              # 模块导出
-│       └── resilience_inference.py  # 核心推理系统类
-├── inference_demo.py                # 使用演示脚本
-├── api_server.py                    # API服务（已集成推理层接口）
-├── requirements.txt                 # 依赖（已添加xgboost, shap）
+├── run_ranking_validation.py   ← 主入口：35条线路全排序
+├── validate_inference.py       ← 核心引擎：预测 + Julia验证
+├── run_inference_pipeline_v2.py← Julia调用管道：反事实MC数据生成
+├── data/
+│   ├── ac_dc_real_case.xlsx          ← 配电网拓扑
+│   ├── topology_reconfiguration_results.xlsx ← 拓扑重构结果
+│   ├── mess_dispatch_hourly.xlsx     ← MESS调度结果
+│   ├── inference_baseline_real.json  ← Julia基线
+│   └── monte_carlo/                  ← MC仿真原始数据
+├── output/
+│   ├── line_ranking_report.md        ← 排序报告
+│   └── line_ranking_report.json      ← 排序数据
 └── docs/
-    └── inference_guide.md           # 本使用指南
+    ├── algorithm_explanation.md      ← 算法说明（傻瓜式）
+    └── inference_guide.md            ← 本使用指南
 ```
 
 ---
 
-## 九、常见问题
+## 关键参数说明
 
-### Q1: 报错 "XGBoost未安装"
-```bash
-pip install xgboost
-```
+### run_ranking_validation.py
 
-### Q2: 报错 "SHAP未安装"
-```bash
-pip install shap
-```
+| 参数 | 说明 | 默认值 |
+|------|------|--------|
+| `--predict-only` / `-p` | 仅预测排序，不跑Julia验证 | 否 |
+| `--top N` / `-t N` | Julia验证排名前N条线路 | 10 |
+| `--output PATH` / `-o PATH` | 输出报告路径 | `output/line_ranking_report.md` |
 
-### Q3: 数据列识别不正确
-检查数据列名是否符合要求，或使用自定义列名配置。
+### validate_inference.py
 
-### Q4: SHAP计算很慢
-SHAP计算需要遍历所有样本，数据量大时可能较慢。可以先对数据采样：
-```python
-df_sample = df.sample(n=1000, random_state=42)
-system = ResilienceInferenceSystem(df_sample)
-```
+| 参数 | 说明 |
+|------|------|
+| `--lines L1 L2 ...` | 要测试的线路名称（如 AC_Line_19 DC_Line_1） |
+| `--multi` / `-m` | 将所有线路作为一组同时加固 |
+| `--both` / `-b` | 逐个 + 组合都测 |
+| `--batch` | 批量模式（逐个 + 两两 + 全部） |
+| `--predict-only` / `-p` | 只做推理预测，不跑Julia |
 
 ---
 
-## 十、技术原理
+## 常见问题
 
-### 代理模型 (Surrogate Model)
-使用XGBoost回归器建立拓扑状态到失负荷量的映射：
-$$f(X_{topology}) \rightarrow Y_{loss}$$
+### Q: 运行报错 "未找到拓扑文件"
+确保 `data/ac_dc_real_case.xlsx` 存在。这是配电网拓扑文件，包含 bus、cable、dcbus、dcimpedance、inverter 等工作表。
 
-### SHAP归因
-基于博弈论的Shapley值计算每个特征的贡献：
-$$\phi_i = \sum_{S \subseteq N \setminus \{i\}} \frac{|S|!(n-|S|-1)!}{n!} [f(S \cup \{i\}) - f(S)]$$
+### Q: 运行报错 "未找到MC数据文件"
+仅在 Julia 验证模式下需要 MC 数据。使用 `--predict-only` 可以跳过。
 
-全局敏感性：
-$$S_i = \text{mean}(|\phi_i|)$$
+### Q: 预测结果全是0
+检查 `topology_reconfiguration_results.xlsx` 中目标线路是否有故障记录（状态=0）。如果某条线路在所有场景中都保持正常（状态=1），则无法评估加固收益。
 
-### 反事实推理
-模拟干预效果：
-$$\Delta = \frac{Y_{original} - Y_{counterfactual}}{Y_{original}}$$
+### Q: Julia验证失败
+1. 确保 Julia 已安装且在 PATH 中
+2. 确保 Gurobi 许可证有效
+3. 检查 `Project.toml` 中的依赖是否已安装（运行 `julia setup.jl`）
+
+### Q: 预测误差较大
+推理层是近似方法，对于某些特殊拓扑可能误差较大。误差等级：
+- ✓ 误差 < 2%（优秀）
+- △ 误差 < 5%（良好）
+- ✗ 误差 ≥ 5%（需改进）
 
 ---
 
-如有问题，请联系开发团队。
+## 算法原理
+
+详见 [algorithm_explanation.md](algorithm_explanation.md)
+
+核心公式：
+
+**综合改善率** = 0.6 × 失负荷改善率 + 0.4 × 超时节点改善率
+
+三层预测方法：
+1. **拓扑加权比例归因**（下界）
+2. **XGBoost分位数回归反事实**（数据驱动）
+3. **连通性物理模型**（上界）
+
+集成策略：
+- 关键瓶颈线路（BC>0.08 或 孤立负荷>20%）→ 使用拓扑归因
+- 普通分支线路 → 取 avg(拓扑归因, 连通性模型)
