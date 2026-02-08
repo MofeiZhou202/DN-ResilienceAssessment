@@ -145,10 +145,13 @@ def  build_network_topology(data_dir: Path = None) -> Dict[str, Dict]:
             tie_switches[26 + len(dc_edges) + vsc_num] = (ac_bus, dc_bus)
     
     # 5. 给节点添加AC负荷属性
+    # 注意: ETAP导出的lumpedload表中MVA列实际存储的是kW值（如100, 300）
+    # 这是ETAP软件的命名惯例，Julia侧也直接作为kW使用
+    # 字段名'load_mva'/'isolated_load_mva'等也是历史命名，实际单位为kW
     load_on_bus = {}
     for _, r in loads_ac.iterrows():
         bus = r.get('Bus')
-        mva = r.get('MVA', 0)
+        mva = r.get('MVA', 0)  # 实际单位: kW（ETAP命名误导）
         if pd.notna(bus) and pd.notna(mva):
             load_on_bus[bus] = float(mva)
             if bus in G.nodes:
@@ -537,7 +540,7 @@ def  build_network_topology(data_dir: Path = None) -> Dict[str, Dict]:
         print(f"  故障传播区域 (Top-{min(10, len(fz_lines))}):")
         print(f"    {'线路':<14} {'簇负荷':>6} {'有效FZ':>6} {'直接FZ':>6}")
         for lid, clust_l, eff_l, direct_l in fz_lines[:10]:
-            print(f"    {lid:<14} {clust_l:>6.0f} {eff_l:>6.0f} {direct_l:>6.0f} MVA")
+            print(f"    {lid:<14} {clust_l:>6.0f} {eff_l:>6.0f} {direct_l:>6.0f} kW")
     else:
         print(f"  故障传播区域: 所有r=0线路故障后均有替代路径 (无隔离风险)")
     
@@ -2040,7 +2043,7 @@ def validate_single(target_line: str, merged, line_cols, baseline, data_dir, pre
     print(f"    故障样本: {pred['n_fault']}/{len(merged)}")
     print(f"    受影响场景: {pred.get('n_affected_scenarios', '?')}/100")
     switch_tag = '★关键瓶颈' if pred.get('topo_is_critical') else '普通分支'
-    print(f"    {switch_tag} (BC={pred.get('topo_betweenness', 0):.3f}, IsoLoad={pred.get('topo_iso_load_mva', 0):.0f}MVA)")
+    print(f"    {switch_tag} (BC={pred.get('topo_betweenness', 0):.3f}, IsoLoad={pred.get('topo_iso_load_mva', 0):.0f}kW)")
     print(f"    方法明细:")
     print(f"      等权比例归因:      {pred.get('plain_prop_improvement', 0):.2%}")
     print(f"      拓扑加权归因:      {pred.get('topo_prop_improvement', 0):.2%}")
