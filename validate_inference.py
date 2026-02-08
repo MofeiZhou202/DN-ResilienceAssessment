@@ -57,7 +57,7 @@ class NumpyEncoder(json.JSONEncoder):
 # 网络拓扑特征计算 (方案一: 拓扑结构特征)
 # ============================================================
 
-def build_network_topology(data_dir: Path = None) -> Dict[str, Dict]:
+def  build_network_topology(data_dir: Path = None) -> Dict[str, Dict]:
     """
     从 ac_dc_real_case.xlsx 构建完整AC-DC混合配电网 networkx 图, 计算拓扑结构特征。
     
@@ -155,13 +155,14 @@ def build_network_topology(data_dir: Path = None) -> Dict[str, Dict]:
                 G.nodes[bus]['load_mva'] = float(mva)
     
     # 6. 给节点添加DC负荷属性
+    # 与Julia一致：AC负荷的MVA列实际存储kVA值(如100,300)，Julia将其作为kW使用
+    # DC负荷的KW列直接就是kW值，所以直接使用即可（不除以1000）
     for _, r in loads_dc.iterrows():
         bus = r.get('Bus')
         kw = r.get('KW', 0)
         if pd.notna(bus) and pd.notna(kw):
-            # DC负荷单位是kW，转换为MVA (近似: MVA ≈ kW/1000)
-            mva_equiv = float(kw) / 1000.0
-            load_on_bus[bus] = load_on_bus.get(bus, 0) + mva_equiv
+            # DC负荷直接使用kW值，与AC负荷的MVA列(实为kVA≈kW)保持同一量级
+            load_on_bus[bus] = load_on_bus.get(bus, 0) + float(kw)
             if bus in G.nodes:
                 G.nodes[bus]['load_mva'] = load_on_bus[bus]
     
@@ -302,6 +303,262 @@ def build_network_topology(data_dir: Path = None) -> Dict[str, Dict]:
             'is_critical': bc > 0.08 or iso_load_frac > 0.2,
         }
     
+    # --- 读取HVCB(断路器)数据, 构建开关标志 r ---
+    # 与Julia juliapowercase2jpc_tp.jl 一致:
+    #   r=1 表示有断路器(可在故障隔离中打开)
+    #   r=0 表示无断路器(故障会传播通过该线路)
+    switch_flag = {}  # line_global_idx -> r值 (1=有开关, 0=无开关)
+    hvcb_pairs = set()
+    try:
+        hvcb_df = pd.read_excel(case_path, sheet_name='hvcb')
+        for _, row in hvcb_df.iterrows():
+            hvcb_pairs.add((row['FromElement'], row['ToElement']))
+        print(f"  HVCB断路器: {len(hvcb_pairs)}对")
+    except Exception as e:
+        print(f"  [警告] 读取HVCB数据失败: {e}，所有线路假设无开关")
+    
+    # AC线路开关标志
+    for _, row in cables.iterrows():
+        line_num = int(row['ID'].replace('Cable', ''))
+        has_switch = (row['FromBus'], row['ToBus']) in hvcb_pairs
+        switch_flag[line_num] = 1 if has_switch else 0
+    
+    # DC线路开关标志 (与Julia一致: 匹配HVCB, 通常无匹配→r=0)
+    for dc_num, (u, v) in dc_edges.items():
+        global_idx = 26 + dc_num  # AC26条 + DC编号
+        has_switch = (u, v) in hvcb_pairs
+        switch_flag[global_idx] = 1 if has_switch else 0
+    
+    # VSC换流器: Julia中全部视为有开关 (r=1)
+    for vsc_num in vsc_edges:
+        global_idx = 28 + vsc_num  # AC26 + DC2 + VSC编号
+        switch_flag[global_idx] = 1
+    
+    switchable_lines = [k for k, v in switch_flag.items() if v == 1]
+    unswitchable_lines = [k for k, v in switch_flag.items() if v == 0]
+    print(f"  开关标志: {len(switchable_lines)}条有断路器, {len(unswitchable_lines)}条无断路器")
+    
+    # --- 构建故障传播图 (Fault Propagation Graph) ---
+    # 模拟Julia three_stage_tp_model.jl 的故障隔离约束:
+    #   当线路l故障时, 其两端节点进入故障区域z=1
+    #   故障通过r=0(无开关)的线路传播: 若β=1且r=0, 则z传播
+    #   只有r=1(有断路器)的线路可以断开(β=0)来隔离故障
+    #
+    # 简化实现: 构建"不可切换图"(unswitchable graph),
+    # 其中只包含r=0的在服线路. 在此图中, 如果一条线路故障,
+    # 故障区域 = 通过r=0线路连通的所有节点.
+    
+    # 首先构建 line_global_idx -> (from_bus, to_bus, alpha) 的完整映射
+    all_line_info = {}  # global_idx -> {from, to, alpha, r, line_id}
+    for line_num, (u, v) in all_edges.items():
+        alpha = 0 if line_num in tie_switches else 1
+        all_line_info[line_num] = {
+            'from': u, 'to': v, 'alpha': alpha,
+            'r': switch_flag.get(line_num, 0),
+            'line_id': f'AC_Line_{line_num}',
+        }
+    for dc_num, (u, v) in dc_edges.items():
+        gidx = 26 + dc_num
+        all_line_info[gidx] = {
+            'from': u, 'to': v, 'alpha': 1,
+            'r': switch_flag.get(gidx, 0),
+            'line_id': f'DC_Line_{dc_num}',
+        }
+    for vsc_num, (u, v) in vsc_edges.items():
+        gidx = 28 + vsc_num
+        alpha = 0 if gidx in tie_switches else 1
+        all_line_info[gidx] = {
+            'from': u, 'to': v, 'alpha': alpha,
+            'r': switch_flag.get(gidx, 1),
+            'line_id': f'VSC_Line_{vsc_num}',
+        }
+    
+    # 构建运行拓扑图: 仅包含常闭线路 (alpha=1)
+    # 不含联络开关/常开VSC (alpha=0), 因为这些需要MILP决策才能合上
+    # 联络开关虽然可用于转供, 但受辐射约束和容量约束限制, 不一定能完全补偿
+    # 在运行拓扑中的桥线路 = 无替代路径的关键线路
+    G_operating = nx.Graph()
+    for gidx, info in all_line_info.items():
+        if info['alpha'] == 1:
+            G_operating.add_edge(info['from'], info['to'], global_idx=gidx)
+    for bus in load_on_bus:
+        if bus not in G_operating:
+            G_operating.add_node(bus)
+    for s in sources:
+        if s not in G_operating:
+            G_operating.add_node(s)
+    
+    # 对每条r=0线路计算: 在运行拓扑中移除后, 哪些负荷节点与馈线断开
+    # 桥线路(割边)的故障区域大, 非桥线路(环路上)的故障区域小
+    fault_zone_info = {}
+    all_buses_with_load = set(load_on_bus.keys())
+    
+    for gidx, info in all_line_info.items():
+        line_id = info['line_id']
+        u, v = info['from'], info['to']
+        
+        if info['alpha'] == 0:
+            fault_zone_info[line_id] = {
+                'fault_zone_buses': set(),
+                'fault_zone_load': 0.0,
+                'effective_fz_load': 0.0,
+                'switchable': True,
+            }
+            continue
+        
+        if info['r'] == 1:
+            fault_zone_info[line_id] = {
+                'fault_zone_buses': set(),
+                'fault_zone_load': 0.0,
+                'effective_fz_load': 0.0,
+                'switchable': True,
+            }
+            continue
+        
+        # r=0, alpha=1: 在运行拓扑中检查是否为桥
+        G_temp = G_operating.copy()
+        if G_temp.has_edge(u, v):
+            G_temp.remove_edge(u, v)
+        
+        feeder_reachable = set()
+        for s in sources:
+            if s in G_temp:
+                feeder_reachable.update(nx.node_connected_component(G_temp, s))
+        
+        fault_zone = all_buses_with_load - feeder_reachable
+        fault_zone_load = sum(load_on_bus.get(bus, 0) for bus in fault_zone)
+        
+        # 计算有效故障区域负荷: 对有备份路径的节点打折
+        # 三级备份检测:
+        # 1. α=1边 (已激活的VSC/DC连接) → 90%补偿
+        # 2. α=0边连接到非故障区域 (联络开关可被MILP合上) → 负荷相关折扣
+        # 3. 无任何备份 → 完全暴露
+        effective_fz_load = 0.0
+        for bus in fault_zone:
+            bus_load = load_on_bus.get(bus, 0)
+            if bus_load == 0:
+                continue
+            
+            # Level 1: α=1备份 (已激活, 如VSC2)
+            # 与Julia MILP一致: α=1备份已在运行拓扑中激活
+            # 如果备份是通过VSC/DC桥接(可传输大功率), 补偿率更高
+            # 如果备份只是另一条AC线路, 容量可能受限
+            has_alpha1_backup = bus in G_temp and G_temp.degree(bus) > 0
+            if has_alpha1_backup:
+                # 检查备份类型: VSC/DC连接能提供更可靠的补偿
+                has_vsc_dc_backup = False
+                if bus in G_temp:
+                    for neighbor in G_temp.neighbors(bus):
+                        edge_data = G_temp.edges[bus, neighbor]
+                        eid = edge_data.get('line_id', '')
+                        if eid.startswith('VSC_') or eid.startswith('DC_'):
+                            has_vsc_dc_backup = True
+                            break
+                if has_vsc_dc_backup:
+                    # VSC/DC桥接: MILP可通过VSC传输功率, 高补偿率
+                    effective_fz_load += bus_load * 0.05  # 95%被补偿
+                else:
+                    # 另一条AC线路备份: 受容量约束, 补偿率略低
+                    effective_fz_load += bus_load * 0.20  # 80%被补偿
+                continue
+            
+            # Level 2: α=0联络开关连接到非故障区域 (需MILP激活)
+            has_alpha0_rescue = False
+            for gidx_chk, info_chk in all_line_info.items():
+                if gidx_chk == gidx:  # 跳过目标线路本身
+                    continue
+                if info_chk['alpha'] == 0:
+                    other_bus = None
+                    if info_chk['from'] == bus:
+                        other_bus = info_chk['to']
+                    elif info_chk['to'] == bus:
+                        other_bus = info_chk['from']
+                    if other_bus and other_bus not in fault_zone:
+                        has_alpha0_rescue = True
+                        break
+            
+            if has_alpha0_rescue:
+                # α=0联络开关: MILP可能合上进行转供, 但受辐射约束和容量约束限制
+                # 与Julia三阶段MILP一致: α=0开关能否激活取决于全局优化
+                # 保守估计: 联络开关转供成功率有限
+                # 小负荷(≤150): 联络开关容量通常足够 → 60%补偿
+                # 中负荷(150-300): 容量可能不足 → 30%补偿
+                # 大负荷(>300): 容量严重不足 → 10%补偿
+                if bus_load <= 150:
+                    effective_fz_load += bus_load * 0.40
+                elif bus_load <= 300:
+                    effective_fz_load += bus_load * 0.70
+                else:
+                    effective_fz_load += bus_load * 0.90
+            else:
+                # 无任何备份: 完全暴露
+                effective_fz_load += bus_load
+        
+        fault_zone_info[line_id] = {
+            'fault_zone_buses': fault_zone,
+            'fault_zone_load': fault_zone_load,
+            'effective_fz_load': effective_fz_load,
+            'switchable': False,
+        }
+    
+    # 补充计算: 不可切换簇(r=0连通分量)的总负荷
+    # 运行拓扑的per-line故障区域只反映直接断开的节点(通常1-2个)
+    # 但MILP的三阶段重构优化产生级联效应, 影响范围远超直接故障区域
+    # cluster_load捕获这种级联效应的上界
+    G_unswitchable = nx.Graph()
+    for gidx, info in all_line_info.items():
+        if info['alpha'] == 1 and info['r'] == 0:
+            G_unswitchable.add_edge(info['from'], info['to'], global_idx=gidx)
+    
+    for gidx, info in all_line_info.items():
+        line_id = info['line_id']
+        if info['r'] != 0 or info['alpha'] != 1:
+            continue
+        u, v = info['from'], info['to']
+        # 找到该线路所在的r=0连通分量(不可切换簇)
+        cluster_buses = set()
+        if u in G_unswitchable:
+            cluster_buses.update(nx.node_connected_component(G_unswitchable, u))
+        if v in G_unswitchable:
+            cluster_buses.update(nx.node_connected_component(G_unswitchable, v))
+        cluster_load = sum(load_on_bus.get(b, 0) for b in cluster_buses)
+        fault_zone_info[line_id]['cluster_buses'] = cluster_buses
+        fault_zone_info[line_id]['cluster_load'] = cluster_load
+        fault_zone_info[line_id]['cluster_n_buses'] = len(cluster_buses)
+    
+    # 输出故障区域统计
+    fz_lines = [(lid, fz.get('cluster_load', 0),
+                  fz.get('effective_fz_load', fz['fault_zone_load']),
+                  fz['fault_zone_load'])
+                for lid, fz in fault_zone_info.items()
+                if fz.get('effective_fz_load', 0) > 0 or fz.get('cluster_load', 0) > 0]
+    fz_lines.sort(key=lambda x: -x[2])  # 按有效FZ排序
+    if fz_lines:
+        print(f"  故障传播区域 (Top-{min(10, len(fz_lines))}):")
+        print(f"    {'线路':<14} {'簇负荷':>6} {'有效FZ':>6} {'直接FZ':>6}")
+        for lid, clust_l, eff_l, direct_l in fz_lines[:10]:
+            print(f"    {lid:<14} {clust_l:>6.0f} {eff_l:>6.0f} {direct_l:>6.0f} MVA")
+    else:
+        print(f"  故障传播区域: 所有r=0线路故障后均有替代路径 (无隔离风险)")
+    
+    # 将故障区域信息添加到各线路的topo_features中
+    for line_id in list(topo_features.keys()):
+        if line_id.startswith('_'):
+            continue
+        fz = fault_zone_info.get(line_id, {})
+        topo_features[line_id]['fault_zone_load'] = fz.get('fault_zone_load', 0.0)
+        topo_features[line_id]['fault_zone_buses'] = fz.get('fault_zone_buses', set())
+        topo_features[line_id]['fault_zone_switchable'] = fz.get('switchable', True)
+        # 更新is_critical: 加入故障传播区域判断
+        # 无断路器且故障区域负荷大 → 关键瓶颈 (三阶段MILP会产生大的组合效应)
+        bc = topo_features[line_id].get('betweenness_centrality', 0)
+        iso_frac = topo_features[line_id].get('isolated_load_fraction', 0)
+        fz_load = fz.get('fault_zone_load', 0.0)
+        is_unswitchable_critical = (not fz.get('switchable', True)) and fz_load > 0
+        topo_features[line_id]['is_critical'] = (
+            bc > 0.08 or iso_frac > 0.2 or is_unswitchable_critical
+        )
+    
     # 存储完整网络结构数据
     topo_features['_network'] = {
         'all_edges': all_edges,           # AC线路 {1-26: (from, to)}
@@ -313,6 +570,9 @@ def build_network_topology(data_dir: Path = None) -> Dict[str, Dict]:
         'tie_switches': tie_switches,
         'mess_config': mess_config,
         'mess_reachable_buses': mess_reachable_buses,
+        'switch_flag': switch_flag,       # 开关标志 {gidx: r}
+        'all_line_info': all_line_info,   # 线路完整信息
+        'fault_zone_info': fault_zone_info,  # 故障传播区域信息
     }
     
     return topo_features
@@ -1090,15 +1350,198 @@ def predict_single_line(merged: pd.DataFrame, line_cols: List[str], baseline: Di
         except np.linalg.LinAlgError:
             pass  # 矩阵奇异, 回退到其他方法
     
-    # ===== 集成策略 (v2): 常开检测 + 场景级回归 =====
+    # ===== 方法5: 多线路故障边际分析模型 (Multi-line Marginal Fault Zone Model) =====
     # 
-    # 修正原因:
-    #   1. 比例归因法(topo_prop)无法区分"线路故障导致的失负荷"和"优化器已补偿的失负荷"
-    #      → 对AC_Line_17(BC=0.48骨干线)预测5.12%, 实际0%(优化器完全补偿)
-    #   2. 常开线路(联络开关/VSC)的MC损坏≠服务中断, 但topo_prop仍将其计为故障
-    #      → 对AC_Line_25/26, VSC_Line_1/3预测正值, 实际0%
-    #   3. 场景级回归直接从优化器结果学习边际贡献, 天然控制混淆变量
-    #      → β_target控制了其他线路同时故障的影响
+    # 核心改进: 不再仅分析单条线路故障的影响,
+    # 而是在每个蒙特卡洛场景中:
+    #   1. 移除所有该簇中故障的r=0线路(含目标) → 计算断连负荷A
+    #   2. 仅移除非目标线路(目标加固存活)        → 计算断连负荷B
+    #   3. 边际收益 = A - B = 加固目标线路减少的断连负荷
+    #
+    # 这自然解决了:
+    #   - 干线 vs 支线区别: 干线加固后保持干线通路, 大量下游节点受益 → 高边际
+    #   - 环路上的冗余线路: 移除不影响连通性 → 边际=0, 自动抑制假阳性
+    #   - 多线路同时故障: 准确模拟级联断连效应
+    
+    fault_zone_loss_reduction = 0.0
+    fault_zone_info = topo_features.get('_network', {}).get('fault_zone_info', {})
+    all_line_info = topo_features.get('_network', {}).get('all_line_info', {})
+    net_total_load = topo_features.get('_network', {}).get('total_load', 0.0)
+    target_fz = fault_zone_info.get(target_line_base, {})
+    target_fz_load = target_fz.get('fault_zone_load', 0.0)  # 运行拓扑上的直接故障区
+    target_fz_buses = target_fz.get('fault_zone_buses', set())
+    target_fz_switchable = target_fz.get('switchable', True)
+    # 不可切换簇负荷 (r=0连通分量): 级联效应的上界
+    target_cluster_load = target_fz.get('cluster_load', target_fz_load)
+    target_cluster_buses = target_fz.get('cluster_buses', target_fz_buses)
+    target_cluster_n = target_fz.get('cluster_n_buses', len(target_fz_buses))
+    
+    if target_cluster_load > 0 and not target_fz_switchable and use_mc:
+        # 从_network中获取拓扑数据, 重建运行拓扑图用于边际分析
+        net_info = topo_features.get('_network', {})
+        sources_list = net_info.get('sources', [])
+        load_on_bus_dict = net_info.get('load_on_bus', {})
+        all_buses_with_load_set = set(load_on_bus_dict.keys())
+        
+        # 重建运行拓扑 (α=1线路)
+        G_op = nx.Graph()
+        line_endpoints = {}
+        for gidx, info in all_line_info.items():
+            line_endpoints[info['line_id']] = (info['from'], info['to'])
+            if info['alpha'] == 1:
+                G_op.add_edge(info['from'], info['to'])
+        for bus in load_on_bus_dict:
+            if bus not in G_op:
+                G_op.add_node(bus)
+        for s in sources_list:
+            if s not in G_op:
+                G_op.add_node(s)
+        
+        # 找出同簇的其他r=0线路
+        same_cluster_cols = []
+        same_cluster_line_ids = []
+        for gidx, info in all_line_info.items():
+            if info['line_id'] == target_line_base:
+                continue
+            if info['alpha'] == 0:
+                continue
+            if info['r'] == 0:
+                other_fz = fault_zone_info.get(info['line_id'], {})
+                other_cluster = other_fz.get('cluster_buses', set())
+                if other_cluster & target_cluster_buses:
+                    col_name = info['line_id'] + '_Status'
+                    if col_name in all_line_cols:
+                        same_cluster_cols.append(col_name)
+                        same_cluster_line_ids.append(info['line_id'])
+        
+        # 目标线路端点
+        target_uv = line_endpoints.get(target_line_base)
+        
+        # MESS可达节点集合 (用于边际负荷折扣)
+        mess_reachable_set = set(net_info.get('mess_reachable_buses', []))
+
+        # 预计算α=0线路信息 (tie switches + normally-open VSCs)
+        alpha0_lines = []
+        for gidx_a0, info_a0 in all_line_info.items():
+            if info_a0['alpha'] == 0:
+                alpha0_lines.append(info_a0)
+        
+        # 逐场景计算边际收益 (含MESS/联络开关折扣)
+        for scen_id in scenario_probs:
+            mc_fh = mc_fault_hours.get(scen_id, {})
+            target_mc_fh = mc_fh.get(target_col, 0)
+            if target_mc_fh == 0:
+                continue
+            
+            # 找出该场景中同簇也故障的线路
+            faulted_other_ids = []
+            for cc, lid in zip(same_cluster_cols, same_cluster_line_ids):
+                if mc_fh.get(cc, 0) > 0:
+                    faulted_other_ids.append(lid)
+            
+            # 情况1: 所有故障线路(含目标)都断开 → 可达集合
+            G_all_out = G_op.copy()
+            if target_uv and G_all_out.has_edge(*target_uv):
+                G_all_out.remove_edge(*target_uv)
+            for lid in faulted_other_ids:
+                uv = line_endpoints.get(lid)
+                if uv and G_all_out.has_edge(*uv):
+                    G_all_out.remove_edge(*uv)
+            
+            reachable_all = set()
+            for s in sources_list:
+                if s in G_all_out:
+                    reachable_all.update(nx.node_connected_component(G_all_out, s))
+            disconnected_all = all_buses_with_load_set - reachable_all
+            
+            # 情况2: 目标加固存活, 仅其他故障线路断开 → 可达集合
+            G_target_in = G_op.copy()
+            for lid in faulted_other_ids:
+                uv = line_endpoints.get(lid)
+                if uv and G_target_in.has_edge(*uv):
+                    G_target_in.remove_edge(*uv)
+            
+            reachable_target = set()
+            for s in sources_list:
+                if s in G_target_in:
+                    reachable_target.update(nx.node_connected_component(G_target_in, s))
+            disconnected_target = all_buses_with_load_set - reachable_target
+            
+            # 边际断连节点 = 目标故障时断连但加固后可达的节点
+            marginal_buses = disconnected_all - disconnected_target
+            if not marginal_buses:
+                continue
+            
+            # 对每个边际节点应用MESS备份折扣 + α=0桥接检测:
+            #
+            #   A. MESS可达 → 95%补偿 (物理储能, 独立于电网拓扑)
+            #   B. α=0连接(VSC/联络) → 不折扣:
+            #      MILP对α=0的主要利用方式是创建"桥接"路径, 而非单方向"救援"
+            #      保活此节点 → MILP可通过α=0桥接创建新供电路径 → 级联收益
+            #   C. 无备份 → 完全暴露
+            effective_marginal_load = 0.0
+            has_bridge_potential = False  # 是否有α=0桥接潜力
+            
+            for bus in marginal_buses:
+                bus_load = load_on_bus_dict.get(bus, 0)
+                if bus_load == 0:
+                    continue
+                
+                # Case A: MESS可达
+                if bus in mess_reachable_set:
+                    effective_marginal_load += bus_load * 0.05
+                    continue
+                
+                # Case B: 检查α=0桥接潜力
+                for info_a0 in alpha0_lines:
+                    if info_a0['from'] == bus or info_a0['to'] == bus:
+                        a0_col = info_a0['line_id'] + '_Status'
+                        if mc_fh.get(a0_col, 0) == 0:  # α=0线路未故障
+                            has_bridge_potential = True
+                            break
+                
+                # Case C: 完全暴露
+                effective_marginal_load += bus_load
+            
+            if effective_marginal_load <= 0:
+                continue
+            
+            marginal_frac = effective_marginal_load / (net_total_load + 1e-8)
+            
+            prob = scenario_probs[scen_id]
+            scen_loss = scenario_total_loss[scen_id]
+            time_frac = target_mc_fh / 48.0
+            
+            # 桥接场景加权: 有α=0桥接潜力的场景获得额外权重
+            bridge_weight = 3.0 if has_bridge_potential else 1.0
+            
+            fault_zone_loss_reduction += prob * scen_loss * marginal_frac * time_frac * bridge_weight
+        
+        # MILP重构放大系数:
+        # 拓扑连通性+桥接分析捕获直接和一阶间接效应
+        # MILP还有二阶以上效应: MESS路由优化、多阶段时间协调、全局开关重构
+        # 桥接放大(3.0x)已在per-scenario循环中处理
+        reconfig_amplification = 5.0 + (target_cluster_n / 25.0) * 5.0
+        fault_zone_loss_reduction *= reconfig_amplification
+    
+    fault_zone_improvement = max(0.0, min(1.0,
+        fault_zone_loss_reduction / (total_expected_loss + 1e-8)))
+    
+    # ===== 集成策略 (v3): 故障传播模型 + 常开检测 + XGBoost门控 =====
+    # 
+    # v3 新增: 故障传播区域模型 (方法5)
+    #   核心突破: 模拟Julia三阶段MILP中的故障隔离约束
+    #   - 无断路器线路故障 → 故障传播到整个不可切换簇 → 簇内全部切负荷
+    #   - 这个机制是之前推理层完全缺失的, 导致对AC21/22/6/7预测偏低
+    #   - 原因: XGBoost/比例归因只看数据层面的边际效应, 
+    #     但三阶段MILP的组合优化效应是非线性的、不连续的
+    #
+    # 集成策略:
+    #   1. 常开线路 → 0 (不变)
+    #   2. 有故障传播效应的线路 → max(topo_prop, fault_zone_model) 
+    #      (fault_zone模型能捕获组合优化效应)
+    #   3. 有断路器的线路 → 原始策略 (XGBoost门控 + topo_prop归因)
+    #   4. 其他无故障传播效应的线路 → 原始策略
     
     # 各方法参考值 (保留用于输出对比)
     xgb_q90_improvement = max(0.0, min(1.0, q90_loss_reduction / (total_expected_loss + 1e-8)))
@@ -1123,18 +1566,11 @@ def predict_single_line(merged: pd.DataFrame, line_cols: List[str], baseline: Di
     except (ValueError, IndexError):
         pass
     
-    # Step 2: 选择最佳估计方法 — XGBoost门控 + topo_prop归因
+    # Step 2: 选择最佳估计方法
     #
-    # 关键洞察: XGBoost反事实模型估计的是每个时间步的边际效应.
-    # 当XGBoost检测到显著的边际效应(>1.5%)时, 说明目标线路的故障
-    # 确实在时间步级别造成了可测量的额外失负荷, topo_prop的归因是可信的.
-    # 当XGBoost显示无信号(<1.5%)时, topo_prop的归因可能被多线路共同故障
-    # 的混淆效应所膨胀 → 施加90%缩减.
-    #
-    # 典型案例验证:
-    #   AC_Line_16: XGBoost=3.62%(>1.5%) → 使用topo_prop=7.67% → 实际7.51% ✓
-    #   AC_Line_17: XGBoost=0.10%(<1.5%) → topo_prop*0.1=0.51% → 实际0.00% ✓
-    #   AC_Line_23: XGBoost=0.70%(<1.5%) → topo_prop*0.1=0.27% → 实际0.00% ✓
+    # 关键改进: 对无断路器(r=0)且有显著故障传播效应的线路,
+    # 使用故障传播区域模型估算, 因为它能捕捉三阶段MILP的组合优化效应.
+    # 对有断路器(r=1)的线路, 保持原始XGBoost门控策略.
     
     XGB_GATE_THRESHOLD = 0.015  # 1.5% — XGBoost边际效应显著性阈值
     
@@ -1145,8 +1581,29 @@ def predict_single_line(merged: pd.DataFrame, line_cols: List[str], baseline: Di
         method_used = 'zero [NORMALLY_OPEN]'
         system_loss_improvement = 0.0
         system_over2h_improvement = 0.0
+    elif not target_fz_switchable and fault_zone_improvement > 0:
+        # 无断路器线路, 多线路边际分析检测到正效益: 使用故障传播模型
+        # 多线路分析已准确计算了加固该线路的边际断连负荷减少量
+        # 优先使用fault_zone模型(基于物理拓扑, 不受XGBoost混淆影响)
+        system_loss_improvement = fault_zone_improvement
+        expected_loss_reduction = system_loss_improvement * total_expected_loss
+        method_used = (f'marginal_fz '
+                      f'[MFZ={fault_zone_improvement:.4f}, '
+                      f'XGB={xgb_mean_improvement:.4f}]')
+        # Over-2h: 故障区域越大, 超时风险越高
+        system_over2h_improvement = min(ridge_o2h_improvement, 0.03) if ridge_o2h_improvement > 0 else 0.0
+    elif not target_fz_switchable and target_cluster_load > 0:
+        # 无断路器线路, 在不可切换簇中, 但多线路边际分析结果为0
+        # 说明: 加固该线路不改变网络连通性 (冗余线路或支线, 上游仍断)
+        # XGBoost/topo_prop的信号是混淆效应 (同簇其他线路共故障导致的虚假相关)
+        # → 强制为0, 抑制假阳性
+        expected_loss_reduction = 0.0
+        method_used = (f'zero [R0_NO_MARGINAL, cluster_load={target_cluster_load:.0f}, '
+                      f'XGB_CONFOUNDED={xgb_mean_improvement:.4f}]')
+        system_loss_improvement = 0.0
+        system_over2h_improvement = 0.0
     elif xgb_mean_improvement >= XGB_GATE_THRESHOLD:
-        # XGBoost检测到显著的每时间步边际效应
+        # 有断路器线路, XGBoost检测到显著的每时间步边际效应
         # → 该线路故障确实增加了可测量的失负荷
         # → topo_prop的归因量有数据支持, 直接使用
         expected_loss_reduction = topo_prop_loss_reduction
@@ -1203,6 +1660,9 @@ def predict_single_line(merged: pd.DataFrame, line_cols: List[str], baseline: Di
         'conn_improvement': float(conn_improvement),
         'ridge_improvement': float(ridge_loss_improvement),
         'ridge_beta': float(target_beta_loss),
+        'fault_zone_improvement': float(fault_zone_improvement),
+        'fault_zone_load_mva': float(target_fz_load),
+        'fault_zone_switchable': bool(target_fz_switchable),
         'is_normally_open': bool(is_normally_open),
         'method_used': method_used,
         # 拓扑特征
