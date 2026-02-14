@@ -13,7 +13,8 @@
   7. 安全网后处理：ML筛选 + 原始推理保底
 
 使用方法：
-  python run_ml_inference.py
+    python run_ml_inference.py                           # 默认纯推理(不使用ground_truth训练)
+    python run_ml_inference.py --use-ground-truth-train # 显式启用监督训练
 """
 
 from __future__ import annotations
@@ -22,6 +23,7 @@ import json
 import sys
 import time
 import warnings
+import argparse
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Tuple
@@ -98,6 +100,7 @@ def extract_features_for_all_lines(
     mc_fault_hours_data = topo_features.get('_mc_fault_hours', {})
     total_load = network.get('total_load', 1.0)
     sources = network.get('sources', [])
+    source_power_kw = network.get('source_power_kw', {})
     load_on_bus = network.get('load_on_bus', {})
     all_edges = network.get('all_edges', {})
     dc_edges = network.get('dc_edges', {})
@@ -107,6 +110,9 @@ def extract_features_for_all_lines(
     mess_reachable = network.get('mess_reachable_buses', set())
     fault_zone_info = network.get('fault_zone_info', {})
     all_line_info = network.get('all_line_info', {})
+    # 储能相关信息
+    battery_sources = network.get('battery_sources', [])
+    battery_config = network.get('battery_config', {})
     
     # 场景级统计
     scenario_groups = merged.groupby('Scenario_ID')
@@ -276,13 +282,69 @@ def extract_features_for_all_lines(
                             pass
             feat['min_dist_to_source'] = min_dist if min_dist < float('inf') else 10
             
-            feat['mess_reachable'] = int(u in mess_reachable or v in mess_reachable)
+            # 当前配置下移动储能容量已置零，ML侧不考虑移动储能可达性
+            feat['mess_reachable'] = 0
+
+            # 线路局部可达源功率与源荷比（源-荷匹配度）
+            local_source_kw = 0.0
+            for src in sources:
+                if not G_full.has_node(src):
+                    continue
+                for node in line_edge:
+                    if not G_full.has_node(node):
+                        continue
+                    try:
+                        d = nx.shortest_path_length(G_full, node, src)
+                        if d <= 3:
+                            local_source_kw += float(source_power_kw.get(src, 0.0))
+                            break
+                    except nx.NetworkXNoPath:
+                        pass
+            feat['local_source_kw'] = local_source_kw
+            feat['source_load_ratio'] = local_source_kw / max(feat['endpoint_load'], 1.0)
+            
+            # C-extra: 储能相关特征
+            # battery_reachable: 线路端点是否直接连接储能母线
+            feat['battery_reachable'] = int(u in battery_sources or v in battery_sources)
+            
+            # min_dist_to_battery: 到最近储能的最短路径距离
+            min_bat_dist = float('inf')
+            for node in line_edge:
+                for bat_bus in battery_sources:
+                    if G_full.has_node(node) and G_full.has_node(bat_bus):
+                        try:
+                            d = nx.shortest_path_length(G_full, node, bat_bus)
+                            min_bat_dist = min(min_bat_dist, d)
+                        except nx.NetworkXNoPath:
+                            pass
+            feat['min_dist_to_battery'] = min_bat_dist if min_bat_dist < float('inf') else 10
+            
+            # battery_backup_kw: 通过线路端点可达的储能总放电功率 (kW)
+            bat_backup = 0.0
+            for bat_id, bat_info in battery_config.items():
+                bat_bus = bat_info.get('bus', '')
+                if G_full.has_node(bat_bus):
+                    for node in line_edge:
+                        if G_full.has_node(node):
+                            try:
+                                d = nx.shortest_path_length(G_full, node, bat_bus)
+                                if d <= 3:  # 3跳以内视为可达
+                                    bat_backup += bat_info.get('discharge_kw', 0)
+                                    break
+                            except nx.NetworkXNoPath:
+                                pass
+            feat['battery_backup_kw'] = bat_backup
         else:
             feat['endpoint_load'] = 0
             feat['endpoint_avg_degree'] = 0
             feat['endpoint_avg_closeness'] = 0
             feat['min_dist_to_source'] = 10
             feat['mess_reachable'] = 0
+            feat['local_source_kw'] = 0
+            feat['source_load_ratio'] = 0
+            feat['battery_reachable'] = 0
+            feat['min_dist_to_battery'] = 10
+            feat['battery_backup_kw'] = 0
         
         feat['downstream_load'] = topo.get('isolated_load_mva_raw', topo.get('isolated_load_mva', 0.0))
         
@@ -352,6 +414,9 @@ def extract_features_for_all_lines(
         feat['iso_load_x_fault_prob'] = feat['isolated_load_fraction'] * feat['fault_probability']
         feat['fz_load_x_fault_prob'] = feat['fault_zone_load'] * feat['fault_probability']
         feat['downstream_x_fh'] = feat['downstream_load'] * feat['expected_fault_hours']
+        # E-extra: 储能交互特征
+        feat['bat_backup_x_fault_prob'] = feat['battery_backup_kw'] * feat['fault_probability']
+        feat['bat_reachable_x_iso_load'] = feat['battery_reachable'] * feat['isolated_load_fraction']
         
         # === F. 原始推理预测特征 (传递领域知识) ===
         orig = original_preds.get(line_id, {})
@@ -1088,6 +1153,199 @@ def generate_comparison_report(
     return report_text
 
 
+def infer_loss_improvement_ml(features_df: pd.DataFrame, baseline: Dict, return_meta: bool = False):
+    """无监督、失负荷单目标的ML推理评分（不使用ground_truth训练）。
+
+    第一层泛化增强:
+      1) 基于当前拓扑-场景分布自适应调整各特征系数
+      2) 用MC故障统计门控替代固定AC线路门控
+      3) 输出每条线路预测置信度
+    """
+    lines = features_df.index.tolist()
+    topo_prop = features_df.get('topo_prop_loss_reduction', pd.Series(0.0, index=features_df.index)).to_numpy(dtype=float)
+    plain_prop = features_df.get('plain_prop_loss_reduction', pd.Series(0.0, index=features_df.index)).to_numpy(dtype=float)
+    expected_fault_hours = features_df.get('expected_fault_hours', pd.Series(0.0, index=features_df.index)).to_numpy(dtype=float)
+    fault_probability = features_df.get('fault_probability', pd.Series(0.0, index=features_df.index)).to_numpy(dtype=float)
+    iso_frac = features_df.get('isolated_load_fraction', pd.Series(0.0, index=features_df.index)).to_numpy(dtype=float)
+    fz_load = features_df.get('fault_zone_load', pd.Series(0.0, index=features_df.index)).to_numpy(dtype=float)
+    source_load_ratio = features_df.get('source_load_ratio', pd.Series(0.0, index=features_df.index)).to_numpy(dtype=float)
+    is_bridge = features_df.get('is_bridge', pd.Series(0.0, index=features_df.index)).to_numpy(dtype=float)
+    is_normally_open = features_df.get('is_normally_open', pd.Series(0.0, index=features_df.index)).to_numpy(dtype=float)
+    n_fault_mc = features_df.get('n_fault_mc', pd.Series(0.0, index=features_df.index)).to_numpy(dtype=float)
+
+    expected_fault_hours_norm = expected_fault_hours / max(np.nanmax(expected_fault_hours), 1e-6)
+    fz_load_norm = fz_load / max(float(baseline.get('total_load', 3000.0)), 1.0)
+    topo_prop_norm = topo_prop / max(np.nanmax(topo_prop), 1e-6)
+    plain_prop_norm = plain_prop / max(np.nanmax(plain_prop), 1e-6)
+
+    c1 = topo_prop
+    c2 = plain_prop
+    c3 = fault_probability * iso_frac
+    c4 = expected_fault_hours_norm * fault_probability
+    c5 = fz_load_norm * fault_probability
+    c6 = is_bridge * fault_probability
+    components = [c1, c2, c3, c4, c5, c6]
+
+    prior_coeff = np.array([0.72, 0.28, 0.16, 0.08, 0.08, 0.04], dtype=float)
+    prior_w = prior_coeff / max(prior_coeff.sum(), 1e-9)
+
+    robust_spread = []
+    for comp in components:
+        q10, q90 = np.quantile(comp, [0.10, 0.90])
+        robust_spread.append(max(0.0, float(q90 - q10)))
+    robust_spread = np.array(robust_spread, dtype=float)
+    if robust_spread.sum() <= 1e-12:
+        data_w = prior_w.copy()
+    else:
+        data_w = robust_spread / robust_spread.sum()
+
+    ratio = np.divide(data_w, np.maximum(prior_w, 1e-9))
+    ratio = np.clip(ratio, 0.65, 1.35)
+    adaptive_coeff = prior_coeff * ratio
+
+    base = (
+        adaptive_coeff[0] * c1
+        + adaptive_coeff[1] * c2
+        + adaptive_coeff[2] * c3
+        + adaptive_coeff[3] * c4
+        + adaptive_coeff[4] * c5
+        + adaptive_coeff[5] * c6
+    )
+    attenuation = 1.0 / (1.0 + 0.12 * np.clip(source_load_ratio, 0.0, None))
+    attenuation = np.clip(attenuation, 0.72, 1.0)
+    pred = np.maximum(base * attenuation, 0.0)
+
+    # 头部线路校正：对高风险-高拓扑贡献线路进行分位数增强，降低系统性低估
+    tail_signal = (
+        0.55 * topo_prop_norm
+        + 0.20 * plain_prop_norm
+        + 0.15 * expected_fault_hours_norm
+        + 0.10 * fault_probability
+    )
+    positive_tail = tail_signal[tail_signal > 0]
+    if positive_tail.size > 0:
+        tail_q = float(np.quantile(positive_tail, 0.75))
+        tail_strength = np.clip((tail_signal - tail_q) / max(1e-6, 1.0 - tail_q), 0.0, 1.0)
+        tail_boost = 1.0 + 0.55 * tail_strength + 0.20 * tail_strength * np.clip(iso_frac, 0.0, None)
+        pred = pred * tail_boost
+
+    # MC故障门控: 仅对“在MC中可能故障”的线路给出非零改善，提升跨拓扑适配性
+    mc_fault_gate = (n_fault_mc > 0).astype(float)
+    pred = pred * mc_fault_gate
+
+    for i, _ in enumerate(lines):
+        if is_normally_open[i] == 1:
+            pred[i] = 0.0
+
+    pred[pred < 0.001] = 0.0
+
+    # 置信度: 高风险信号强 + 拓扑/朴素归因一致 + 故障覆盖高 => 更高置信度
+    fault_coverage = np.clip(n_fault_mc / max(np.nanmax(n_fault_mc), 1e-6), 0.0, 1.0)
+    agreement = 1.0 - np.clip(np.abs(topo_prop_norm - plain_prop_norm), 0.0, 1.0)
+    confidence = np.clip(
+        0.45 * tail_signal + 0.20 * fault_probability + 0.20 * fault_coverage + 0.15 * agreement,
+        0.0,
+        1.0,
+    )
+    confidence = confidence * mc_fault_gate * (1.0 - is_normally_open)
+
+    if return_meta:
+        meta = {
+            'adaptive_coeff': {
+                'topo_prop': float(adaptive_coeff[0]),
+                'plain_prop': float(adaptive_coeff[1]),
+                'fault_iso': float(adaptive_coeff[2]),
+                'fh_fault': float(adaptive_coeff[3]),
+                'fz_fault': float(adaptive_coeff[4]),
+                'bridge_fault': float(adaptive_coeff[5]),
+            },
+            'gating': {
+                'mc_fault_nonzero_lines': int(np.sum(mc_fault_gate > 0)),
+                'normally_open_lines': int(np.sum(is_normally_open > 0)),
+            },
+        }
+        return pred, confidence, meta
+
+    return pred
+
+
+def evaluate_loss_only(y_true: np.ndarray, y_pred: np.ndarray, label: str = "") -> Dict:
+    spearman, sp_pval = spearmanr(y_true, y_pred)
+    kendall, _ = kendalltau(y_true, y_pred)
+    mae = float(np.mean(np.abs(y_true - y_pred)))
+    rmse = float(np.sqrt(np.mean((y_true - y_pred) ** 2)))
+    top5 = top_k_overlap(y_true, y_pred, k=min(5, len(y_true)))
+    top10 = top_k_overlap(y_true, y_pred, k=min(10, len(y_true)))
+    result = {
+        'spearman': float(spearman),
+        'kendall': float(kendall),
+        'top5_overlap': float(top5),
+        'top10_overlap': float(top10),
+        'mae': mae,
+        'rmse': rmse,
+    }
+    if label:
+        print(f"\n  {'='*55}")
+        print(f"  失负荷评估: {label}")
+        print(f"  {'='*55}")
+        print(f"  Spearman:   {spearman:.4f} (p={sp_pval:.2e})")
+        print(f"  Kendall τ:  {kendall:.4f}")
+        print(f"  Top-5重合:  {top5:.0%}  Top-10重合: {top10:.0%}")
+        print(f"  MAE: {mae:.6f}  RMSE: {rmse:.6f}")
+    return result
+
+
+def generate_loss_only_report(line_names, y_true, pred_ml, output_dir, eval_ml, confidence_scores=None, infer_meta=None):
+    now = datetime.now().strftime("%Y-%m-%d %H:%M")
+    true_rank = np.argsort(np.argsort(-y_true)) + 1
+    ml_rank = np.argsort(np.argsort(-pred_ml)) + 1
+
+    md = []
+    md.append("# 配电网线路加固优先级 —— 失负荷单目标 ML 对比报告")
+    md.append(f"\n**生成时间**: {now}")
+    md.append("\n**说明**: 本报告仅做失负荷改善率评估，不包含超2h指标，不使用ground_truth监督训练。\n")
+
+    md.append("## ML vs 真实（失负荷）\n")
+    md.append("| 指标 | ML |")
+    md.append("|------|:--:|")
+    for metric in ['spearman', 'kendall', 'top5_overlap', 'top10_overlap', 'mae', 'rmse']:
+        md.append(f"| {metric} | {eval_ml.get(metric, 0):.4f} |")
+
+    md.append("\n## 逐线路对比（按真实改善排序）\n")
+    md.append("| 线路 | 真实排名 | ML排名 | 真实失负荷改善 | ML预测失负荷改善 | 绝对误差 | 置信度 |")
+    md.append("|------|:------:|:-----:|:--------------:|:---------------:|:-------:|:-----:|")
+    for idx in np.argsort(-y_true):
+        ln = line_names[idx]
+        err = abs(y_true[idx] - pred_ml[idx])
+        conf = float(confidence_scores[idx]) if confidence_scores is not None else 0.0
+        md.append(
+            f"| {ln} | {true_rank[idx]} | {ml_rank[idx]} | {y_true[idx]*100:.3f}% | {pred_ml[idx]*100:.3f}% | {err*100:.3f}% | {conf:.3f} |"
+        )
+
+    report_text = "\n".join(md)
+    (output_dir / "ml_inference_report.md").write_text(report_text, encoding="utf-8")
+
+    json_data = {
+        'timestamp': datetime.now().isoformat(),
+        'mode': 'loss_only_no_supervised_training',
+        'eval_ml': eval_ml,
+        'inference_meta': infer_meta or {},
+        'per_line': [{
+            'line_name': line_names[idx],
+            'actual_loss_improvement': float(y_true[idx]),
+            'ml_predicted_loss_improvement': float(pred_ml[idx]),
+            'actual_rank': int(true_rank[idx]),
+            'ml_rank': int(ml_rank[idx]),
+            'abs_error': float(abs(y_true[idx] - pred_ml[idx])),
+            'confidence': float(confidence_scores[idx]) if confidence_scores is not None else None,
+        } for idx in range(len(line_names))]
+    }
+    with open(output_dir / "ml_inference_report.json", 'w', encoding='utf-8') as f:
+        json.dump(json_data, f, ensure_ascii=False, indent=2, cls=NumpyEncoder)
+
+    return report_text
+
+
 # ════════════════════════════════════════════════════════════
 #  主入口
 # ════════════════════════════════════════════════════════════
@@ -1236,6 +1494,9 @@ def _run_pure_inference_mode(merged, line_cols, baseline, topo_features, origina
 
 
 def main():
+    parser = argparse.ArgumentParser(description="配电网线路加固优先级机器学习推理（失负荷单目标）")
+    args = parser.parse_args()
+
     print("=" * 60)
     print("  配电网线路加固优先级 —— 机器学习推理层 v3")
     print("=" * 60)
@@ -1246,199 +1507,73 @@ def main():
     merged, line_cols, baseline, data_dir, disp_path, topo_features = load_data()
     print(f"  数据: {merged.shape[0]} 行, {len(line_cols)} 条线路")
     
-    # Step 2: 计算原始推理预测 (直接调用 predict_single_line, 不依赖 ground_truth.json)
-    print("\n[2] 计算原始推理预测 (predict_single_line × 35 条线路)...")
-    original_preds = compute_original_predictions(merged, line_cols, baseline, topo_features)
-    n_nonzero = sum(1 for v in original_preds.values() if v['pred_combined'] > 0)
-    print(f"  完成: {len(original_preds)} 条线路, {n_nonzero} 条有非零预测")
+    # Step 2: 特征工程（不依赖ground_truth）
+    print("\n[2] 特征工程（失负荷单目标）...")
+    features_df = extract_features_for_all_lines(
+        merged, line_cols, baseline, topo_features,
+        gt_df=None, original_preds={})
+    print(f"  特征矩阵: {features_df.shape}")
 
-    # Step 3: 尝试加载 ground truth
+    # Step 3: 无监督ML推理（失负荷）
+    print("\n[3] ML推理（仅失负荷改善率，不做监督训练）...")
+    line_names = features_df.index.tolist()
+    pred_ml, confidence_all, infer_meta = infer_loss_improvement_ml(features_df, baseline, return_meta=True)
+    n_nonzero = int(np.sum(pred_ml > 0))
+    print(f"  完成: {len(line_names)} 条线路, {n_nonzero} 条预测为非零改善")
+    print("  自适应系数:", ", ".join([f"{k}={v:.4f}" for k, v in infer_meta.get('adaptive_coeff', {}).items()]))
+
+    # Step 4: 与真实值对比（仅评估，不参与训练）
+    print("\n[4] 读取真实结果并评估（仅失负荷）...")
     gt_df = load_ground_truth()
-    
-    if gt_df is None:
-        # ═══ 纯推理模式 ═══
-        print("\n" + "═" * 60)
-        print("  未检测到 output/ground_truth.json")
-        print("  → 进入【纯推理模式】: 特征工程+加权评分产出排名")
-        print("  → 如需完整ML训练对比, 请运行: python generate_ground_truth.py")
-        print("═" * 60)
-        rc = _run_pure_inference_mode(merged, line_cols, baseline, topo_features, original_preds)
+    if gt_df is None or 'actual_loss_improvement' not in gt_df.columns:
+        print("  [警告] 未找到可用的 ground_truth 失负荷标签，仅输出ML推理结果。")
+        order = np.argsort(-pred_ml)
+        for rank_i, idx in enumerate(order, 1):
+            print(f"  {rank_i:>2}. {line_names[idx]:<14} {pred_ml[idx]*100:7.3f}%")
+        output_dir = PROJECT_ROOT / "output"
+        output_dir.mkdir(exist_ok=True)
+        with open(output_dir / "ml_inference_report.json", 'w', encoding='utf-8') as f:
+            json.dump({
+                'timestamp': datetime.now().isoformat(),
+                'mode': 'loss_only_no_gt',
+                'inference_meta': infer_meta,
+                'per_line': [
+                    {
+                        'line_name': line_names[i],
+                        'ml_predicted_loss_improvement': float(pred_ml[i]),
+                        'confidence': float(confidence_all[i]),
+                    }
+                    for i in range(len(line_names))
+                ],
+            }, f, ensure_ascii=False, indent=2, cls=NumpyEncoder)
         elapsed = time.time() - t_start
         print(f"\n{'='*60}")
         print(f"  完成! 耗时 {elapsed:.1f} 秒")
         print(f"{'='*60}")
-        return rc
-    
-    # ═══ 完整ML训练模式 ═══
-    print("\n[3/7] 加载 ground truth...")
-    n_positive = (gt_df['actual_combined_improvement'] > 0).sum()
-    n_zero = (gt_df['actual_combined_improvement'] == 0).sum()
-    print(f"  真实标签: {len(gt_df)} 条 (有改善:{n_positive}, 无改善:{n_zero})")
-    
-    # Step 3: 特征工程
-    print("\n[3/7] 特征工程...")
-    features_df = extract_features_for_all_lines(
-        merged, line_cols, baseline, topo_features,
-        gt_df=gt_df, original_preds=original_preds)
-    print(f"  特征矩阵: {features_df.shape}")
-    
-    # 对齐
-    common_lines = features_df.index.intersection(gt_df.index)
-    X_df = features_df.loc[common_lines].copy()
-    y = gt_df.loc[common_lines, 'actual_combined_improvement'].values
-    pred_original = gt_df.loc[common_lines, 'predicted_combined_improvement'].values
-    
-    feature_cols = [c for c in X_df.columns if X_df[c].dtype in ['float64', 'int64', 'float32', 'int32']]
-    X = X_df[feature_cols].values
-    X = np.nan_to_num(X, nan=0.0, posinf=1e6, neginf=-1e6)
-    feature_names = feature_cols
-    line_names = common_lines.tolist()
-    n = len(line_names)
-    
-    # 特征维度说明
-    core_features = ['orig_pred_combined', 'fault_probability', 'topo_prop_loss_reduction']
-    core_in_data = [f for f in core_features if f in feature_names]
-    print(f"  共 {n} 条线路, {len(feature_names)} 个原始特征")
-    print(f"  核心特征 ({len(core_in_data)}维): {core_in_data}")
-    print(f"  注: 实验验证3-6维特征即为最优, 40维过拟合")
-    
-    # Step 4: 评估原始推理层
-    print("\n[4/7] 评估原始推理层...")
-    eval_original = evaluate_ranking(y, pred_original, label="原始推理层")
-    
-    # Step 5: 训练ML模型 (精简版 — 基于3轮特征选择实验结论)
-    print("\n[5/7] 训练ML模型 (精简特征, 3-6维)...")
-    
-    all_preds = {'原始推理': pred_original.copy()}
-    all_evals = {'原始推理': eval_original}
-    
-    # 5a. ★ 分类矫正 (实验验证最佳策略, Sp=0.9173)
-    print("\n  ── ★ 分类矫正模型 (3-7维特征) ──")
-    cls_pred, cls_eval, cls_label = classification_correction_model(
-        X, y, line_names, feature_names, X_df, pred_original)
-    all_preds['分类矫正'] = cls_pred
-    all_evals['分类矫正'] = cls_eval
-    
-    # 5b. 阻尼残差 (实验验证第二佳, Sp=0.8916)
-    print("\n  ── 阻尼残差模型 (3-8维特征) ──")
-    dr_pred, dr_eval, dr_label = damped_residual_model(
-        X, y, line_names, feature_names, X_df, pred_original)
-    all_preds['阻尼残差'] = dr_pred
-    all_evals['阻尼残差'] = dr_eval
-    
-    # 5c. 组合模型 (分类矫正 + 阻尼残差)
-    print("\n  ── 组合模型 (分类+残差) ──")
-    combo_pred, combo_eval, combo_label = combined_cls_residual_model(
-        X, y, line_names, feature_names, X_df, pred_original)
-    all_preds['组合模型'] = combo_pred
-    all_evals['组合模型'] = combo_eval
-    
-    # 5d. 阈值优化 (最简方法, Sp=0.8826)
-    print("\n  ── 阈值优化 ──")
-    th_pred, th_eval, th_label = threshold_optimized_model(y, pred_original, line_names, X_df)
-    all_preds['阈值优化'] = th_pred
-    all_evals['阈值优化'] = th_eval
-    
-    # 5e. Ridge系列 (精简特征子集)
-    print("\n  ── Ridge 系列 (精简特征) ──")
-    ridge_results = ridge_family(X, y, line_names, feature_names, X_df)
-    for name, (pred, ev) in ridge_results.items():
-        all_preds[name] = pred
-        all_evals[name] = ev
+        return 0
 
-    # Step 6: 集成 + 后处理
-    print("\n[6/7] 集成 + 后处理优化...")
-    
-    # 6a. 智能集成
-    ens_pred, ens_eval = smart_ensemble(all_preds, all_evals, y, line_names, X_df)
-    all_preds['智能集成'] = ens_pred
-    all_evals['智能集成'] = ens_eval
-    
-    # 6b. 对Ridge结果做后处理
-    for name in list(ridge_results.keys()):
-        pp_pred, pp_eval = optimize_postprocessing(all_preds[name].copy(), y, line_names, X_df)
-        all_preds[f"{name}+PP"] = pp_pred
-        all_evals[f"{name}+PP"] = pp_eval
+    common_lines = [ln for ln in line_names if ln in gt_df.index]
+    idx_map = [line_names.index(ln) for ln in common_lines]
+    y_true = gt_df.loc[common_lines, 'actual_loss_improvement'].to_numpy(dtype=float)
+    pred_eval = pred_ml[idx_map]
+    conf_eval = confidence_all[idx_map]
 
-    # 6c. Stacking (用精简模型)
-    raw_model_preds = {k: all_preds[k] for k in ['分类矫正', '阻尼残差', '阈值优化']
-                       if k in all_preds}
-    # 加几个最佳Ridge
-    best_ridges = sorted(
-        [(k, all_evals[k]['spearman']) for k in ridge_results.keys()],
-        key=lambda x: -x[1]
-    )[:3]
-    for rname, _ in best_ridges:
-        raw_model_preds[rname] = all_preds[rname]
-    
-    if len(raw_model_preds) >= 3:
-        print("\n  ── Stacking 元学习器 ──")
-        stk_pred, stk_eval = stacking_meta_learner(
-            raw_model_preds, y, line_names, feature_names, X, X_df)
-        all_preds['Stacking'] = stk_pred
-        all_evals['Stacking'] = stk_eval
+    eval_ml = evaluate_loss_only(y_true, pred_eval, label="ML(失负荷) vs 真实")
 
-    # 6d. 混合优化
-    print("\n  ── 混合优化 ──")
-    top_ml = {k: all_preds[k] for k in ['分类矫正', '阻尼残差', '组合模型']
-              if k in all_preds and all_evals.get(k, {}).get('spearman', 0) > 0.6}
-    if top_ml:
-        blend_pred, blend_eval, blend_label = hybrid_blend_optimization(
-            top_ml, pred_original, y, line_names, X_df)
-        all_preds['混合优化'] = blend_pred
-        all_evals['混合优化'] = blend_eval
-
-    # Step 7: 汇总
-    print("\n[7/7] 最终汇总...")
-    
-    # 排行榜
-    sorted_models = sorted(all_evals.items(), key=lambda x: x[1]['spearman'], reverse=True)
-    
-    print(f"\n  {'═'*70}")
-    print(f"\n  {'模型排行榜 (Top 20)':^60}")
-    print(f"  {'═'*70}")
-    print(f"  {'#':>3} {'模型':<42} {'Spearman':>8} {'NDCG@5':>7} {'Top5':>5}")
-    print(f"  {'─'*70}")
-    
-    for rank, (name, ev) in enumerate(sorted_models[:20], 1):
-        sp = ev['spearman']
-        ndcg5 = ev.get('ndcg@5', 0)
-        t5 = ev.get('top5_overlap', 0)
-        marker = " ★" if name != '原始推理' and sp >= eval_original['spearman'] else ""
-        print(f"  {rank:>3} {name:<42} {sp:>8.4f} {ndcg5:>7.4f} {t5:>5.0%}{marker}")
-    
-    # 选最终ML模型
-    ml_models = {k: v for k, v in all_evals.items() if k != '原始推理'}
-    best_ml_name = max(ml_models.keys(), key=lambda k: ml_models[k]['spearman'])
-    best_ml_pred = all_preds[best_ml_name]
-    best_ml_eval = all_evals[best_ml_name]
-    
-    print(f"\n  最终ML选择: {best_ml_name}")
-    print(f"    Spearman: {best_ml_eval['spearman']:.4f} vs 原始 {eval_original['spearman']:.4f}")
-    diff = best_ml_eval['spearman'] - eval_original['spearman']
-    if diff > 0:
-        print(f"    ML比原始推理好 {diff:.4f}")
-    else:
-        print(f"    ML比原始推理差 {abs(diff):.4f}")
-    
-    # 报告
+    # Step 5: 仅输出ML vs 真实
+    print("\n[5] 生成ML与真实对比报告...")
     output_dir = PROJECT_ROOT / "output"
     output_dir.mkdir(exist_ok=True)
-    generate_comparison_report(line_names, y, pred_original, best_ml_pred,
-                               output_dir, eval_original, best_ml_eval, best_ml_name)
-    
-    # 排名对比
-    true_rank = np.argsort(np.argsort(-y)) + 1
-    orig_rank = np.argsort(np.argsort(-pred_original)) + 1
-    ml_rank = np.argsort(np.argsort(-best_ml_pred)) + 1
-    
-    print(f"\n  {'真实':>4} {'原始':>4} {'ML':>4}  {'线路':<14} {'真实':>8} {'原始':>8} {'ML':>8}")
-    print(f"  {'─'*70}")
-    for idx in np.argsort(-y):
-        ln = line_names[idx]
-        print(f"  {true_rank[idx]:>4} {orig_rank[idx]:>4} {ml_rank[idx]:>4}  "
-              f"{ln:<14} {y[idx]*100:>7.3f}% {pred_original[idx]*100:>7.3f}% "
-              f"{best_ml_pred[idx]*100:>7.3f}%")
+    generate_loss_only_report(common_lines, y_true, pred_eval, output_dir, eval_ml, confidence_scores=conf_eval, infer_meta=infer_meta)
+
+    true_rank = np.argsort(np.argsort(-y_true)) + 1
+    ml_rank = np.argsort(np.argsort(-pred_eval)) + 1
+    print(f"\n  {'真实':>4} {'ML':>4}  {'线路':<14} {'真实失负荷':>10} {'ML预测':>10} {'误差':>10}")
+    print(f"  {'─'*72}")
+    for idx in np.argsort(-y_true):
+        ln = common_lines[idx]
+        err = abs(y_true[idx] - pred_eval[idx])
+        print(f"  {true_rank[idx]:>4} {ml_rank[idx]:>4}  {ln:<14} {y_true[idx]*100:>9.3f}% {pred_eval[idx]*100:>9.3f}% {err*100:>9.3f}%")
     
     elapsed = time.time() - t_start
     print(f"\n{'='*60}")

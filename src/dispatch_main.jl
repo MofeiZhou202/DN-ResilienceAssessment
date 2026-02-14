@@ -285,10 +285,11 @@ end
 # MESSConfig(name, 接入节点, 最大充电功率, 最大放电功率, 储能容量, 初始SOC, 充电效率%, 放电效率%)
 # 配电网级别：典型移动储能系统容量
 const DEFAULT_MESS = [
-    MESSConfig("MESS-1", 5, 1500.0, 1500.0, 4500.0, 4500.0, 92.0, 90.0),   # 1500 kW, 4500 kWh
-    MESSConfig("MESS-2", 10, 1000.0, 1000.0, 4000.0, 4000.0, 92.0, 90.0),  # 1000 kW, 4000 kWh
-    MESSConfig("MESS-3", 30, 500.0, 500.0, 3500.0, 3500.0, 92.0, 90.0),    # 500 kW, 3500 kWh
+    MESSConfig("MESS-1", 5, 150.0, 150.0, 0.0, 0.0, 92.0, 90.0),   # 15 kW, 450 kWh
+    MESSConfig("MESS-2", 10, 100.0, 100.0, 0.0, 0.0, 92.0, 90.0),  # 100 kW, 400 kWh
+    MESSConfig("MESS-3", 30, 50.0, 50.0, 0.0, 0.0, 92.0, 90.0),    # 50 kW, 350 kWh
 ]
+
 
 _normalize_label(value) = strip(string(value))
 
@@ -1081,7 +1082,8 @@ function optimize_hybrid_dispatch(case::HybridGridCase, statuses, weights::Union
     model = Model(Gurobi.Optimizer)
     set_optimizer_attribute(model, "OutputFlag", 1)
     set_optimizer_attribute(model, "LogToConsole", 1)
-    set_optimizer_attribute(model, "TimeLimit", 400)
+    set_optimizer_attribute(model, "LogFile", joinpath(@__DIR__, "..", "output", "gurobi_dispatch.log"))
+    set_optimizer_attribute(model, "TimeLimit", 600)
     set_optimizer_attribute(model, "MIPGap", 0.01)
 
     objective_expr = JuMP.AffExpr(0.0)
@@ -1387,16 +1389,52 @@ function optimize_hybrid_dispatch(case::HybridGridCase, statuses, weights::Union
     end
 
     @objective(model, Min, objective_expr)
+    println("\n=== 模型统计 ===")
+    println("  变量数: $(num_variables(model))")
+    println("  约束数: $(num_constraints(model; count_variable_in_set_constraints=false))")
+    println("  静态储能数: $(case.nstatic), MESS数: $(case.nmess)")
+    println("  场景数: $(scenario_count), 时段: $(hours)h")
+    println("================\n")
     optimize!(model)
 
     status = termination_status(model)
+    primal = primal_status(model)
+    println("\n=== 求解结果 ===")
+    println("  终止状态: $(status)")
+    println("  原始状态: $(primal)")
+    println("  有解: $(JuMP.has_values(model))")
+    if JuMP.has_values(model)
+        println("  目标值: $(objective_value(model))")
+    end
+    println("================\n")
+
     if status == MOI.OPTIMAL
         nothing
     elseif status == MOI.TIME_LIMIT && JuMP.has_values(model)
         gap_value = objective_bound(model)
         println("Warning: Gurobi hit TIME_LIMIT but produced a feasible solution. Best bound: $(gap_value)")
+    elseif status == MOI.INFEASIBLE || status == MOI.INFEASIBLE_OR_UNBOUNDED
+        println("模型不可行，尝试计算冲突...")
+        try
+            compute_conflict!(model)
+            iis_constraints = ConstraintRef[]
+            for (F, S) in list_of_constraint_types(model)
+                for ci in all_constraints(model, F, S)
+                    if MOI.get(model, MOI.ConstraintConflictStatus(), ci) == MOI.IN_CONFLICT
+                        push!(iis_constraints, ci)
+                    end
+                end
+            end
+            println("冲突约束数量: $(length(iis_constraints))")
+            for (i, ci) in enumerate(first(iis_constraints, 20))
+                println("  冲突约束 $i: $(ci)")
+            end
+        catch iis_err
+            println("无法计算IIS: $(iis_err)")
+        end
+        error("调度模型不可行，状态 $(status)")
     else
-        error("调度模型求解失败，状态 $(status)")
+        error("调度模型求解失败，状态 $(status), 原始状态 $(primal)")
     end
 
     scenario_results = Vector{Dict{String, Any}}()

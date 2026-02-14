@@ -57,7 +57,7 @@ class NumpyEncoder(json.JSONEncoder):
 # 网络拓扑特征计算 (方案一: 拓扑结构特征)
 # ============================================================
 
-def  build_network_topology(data_dir: Path = None) -> Dict[str, Dict]:
+def  build_network_topology(data_dir: Path = None, case_path: Path = None) -> Dict[str, Dict]:
     """
     从 ac_dc_real_case.xlsx 构建完整AC-DC混合配电网 networkx 图, 计算拓扑结构特征。
     
@@ -77,7 +77,10 @@ def  build_network_topology(data_dir: Path = None) -> Dict[str, Dict]:
     if data_dir is None:
         data_dir = PROJECT_ROOT / "data"
     
-    case_path = data_dir / "ac_dc_real_case.xlsx"
+    if case_path is None:
+        case_path = data_dir / "ac_dc_real_case.xlsx"
+    else:
+        case_path = Path(case_path)
     if not case_path.exists():
         print(f"  [警告] 未找到配网拓扑文件 {case_path}，使用默认拓扑特征")
         return {}
@@ -171,6 +174,101 @@ def  build_network_topology(data_dir: Path = None) -> Dict[str, Dict]:
     
     sources = ['Bus_草河F27', 'Bus_石楼F12']
     
+    # --- 7. 读取固定储能(Battery)数据, 将储能母线视为辅助电源 ---
+    # Battery储能在故障期间可向本地负荷放电, 是重要的分布式电源
+    # 将储能接入母线加入 sources 列表, 影响:
+    #   (a) 源-荷BC计算: 只统计源→荷最短路径, 储能使附近线路BC降低
+    #   (b) 孤立负荷计算: 与储能连通的负荷不再被视为完全孤立
+    battery_sources = []   # 储能母线列表
+    battery_config = {}    # 储能详细配置
+    try:
+        batteries_df = pd.read_excel(case_path, sheet_name='battery')
+        for _, br in batteries_df.iterrows():
+            bat_bus = br.get('Bus', '')
+            in_service = br.get('InService', True)
+            if pd.notna(bat_bus) and bat_bus and in_service:
+                bat_id = br.get('ID', f'Battery_{len(battery_sources)+1}')
+                # 储能放电功率估算: NrOfCells × NrOfStrings × IdischargeMax (A) × Vpc (V) / 1000 → kW
+                # 简化: 使用 Rated (kVA) 作为额定功率; 容量按4小时估算
+                rated_kva = float(br.get('Rated', 3))  # kVA
+                discharge_max_a = float(br.get('IdischargeMax', 20))
+                n_cells = int(br.get('NrOfCells', 20))
+                n_strings = int(br.get('NrOfStrings', 20))
+                n_packs = int(br.get('NoOfPacks', 20))
+                vbat_max = float(br.get('VbatMax', 120))  # V
+                # 放电功率 (kW) = Vbat × Idischarge × Nstrings / 1000
+                discharge_kw = vbat_max * discharge_max_a * n_strings / 1000.0
+                # 容量 (kWh) = 放电功率 × 4h (保守估计)
+                capacity_kwh = discharge_kw * 4.0
+                
+                battery_sources.append(bat_bus)
+                battery_config[bat_id] = {
+                    'bus': bat_bus,
+                    'discharge_kw': discharge_kw,
+                    'capacity_kwh': capacity_kwh,
+                    'rated_kva': rated_kva,
+                }
+                # 将储能母线加入图节点属性
+                if bat_bus in G.nodes:
+                    G.nodes[bat_bus]['has_battery'] = True
+                    G.nodes[bat_bus]['battery_kw'] = G.nodes[bat_bus].get('battery_kw', 0) + discharge_kw
+        
+        if battery_sources:
+            print(f"  固定储能: {len(battery_sources)}台")
+            for bat_id, bat_info in battery_config.items():
+                print(f"    {bat_id}: 母线={bat_info['bus']}, "
+                      f"放电={bat_info['discharge_kw']:.0f}kW, "
+                      f"容量={bat_info['capacity_kwh']:.0f}kWh")
+    except Exception as e:
+        print(f"  [警告] 读取Battery储能数据失败: {e}，不考虑固定储能")
+
+    # --- 8. 读取光伏微网(PVArray)数据, 将在运光伏母线视为分布式电源 ---
+    pv_sources = []
+    pv_config = {}
+    try:
+        pvarray_df = pd.read_excel(case_path, sheet_name='pvarray')
+        for _, pr in pvarray_df.iterrows():
+            pv_bus = pr.get('Bus', '')
+            in_service = pr.get('InService', True)
+            p_raw = pr.get('PVAPower', 0.0)
+            if pd.isna(pv_bus) or not pv_bus or not in_service:
+                continue
+            try:
+                p_raw = float(p_raw)
+            except Exception:
+                p_raw = 0.0
+            if p_raw <= 0.0:
+                continue
+
+            # ETAP中该列通常为MW(如4.2,0.3)，少数数据也可能已是kW
+            pv_kw = p_raw * 1000.0 if p_raw <= 20.0 else p_raw
+            pv_id = pr.get('ID', f'PV_{len(pv_sources)+1}')
+
+            pv_sources.append(pv_bus)
+            if pv_id in pv_config:
+                pv_config[pv_id]['power_kw'] += pv_kw
+            else:
+                pv_config[pv_id] = {
+                    'bus': pv_bus,
+                    'power_kw': pv_kw,
+                }
+
+            if pv_bus in G.nodes:
+                G.nodes[pv_bus]['has_pv_source'] = True
+                G.nodes[pv_bus]['pv_kw'] = G.nodes[pv_bus].get('pv_kw', 0.0) + pv_kw
+
+        if pv_sources:
+            pv_total_kw = sum(v.get('power_kw', 0.0) for v in pv_config.values())
+            print(f"  光伏微网源: {len(pv_sources)}台, 总可用功率≈{pv_total_kw:.1f}kW")
+    except Exception as e:
+        print(f"  [警告] 读取光伏微网数据失败: {e}，不考虑光伏微网源")
+    
+    # 合并所有源节点: 馈线电源 + 固定储能母线 + 光伏微网母线
+    # 馈线电源: 无限容量, 是主电源
+    # 储能母线: 有限容量, 是辅助电源(在故障期间可以本地供电)
+    all_sources = list(dict.fromkeys(sources + battery_sources + pv_sources))  # 用于BC和孤立负荷计算
+    feeder_sources = list(sources)  # 仅馈线电源(用于严格孤立判断)
+    
     # --- MESS移动储能配置 (与Julia dispatch_main.jl DEFAULT_MESS一致) ---
     # MESS可在交通网络6个节点间移动，向接入的电网节点注入功率
     # Transport节点 → 电网母线: 1→Bus5, 2→Bus10, 3→Bus15, 4→Bus20, 5→Bus25, 6→Bus30
@@ -195,8 +293,55 @@ def  build_network_topology(data_dir: Path = None) -> Dict[str, Dict]:
     print(f"  联络开关(常开): {sorted(tie_switches.keys())}")
     print(f"  MESS移动储能: {len(mess_config)}台, 可达{len(mess_reachable_buses)}个节点")
     
-    # --- 1. Edge Betweenness Centrality (仅AC部分用于排序) ---
-    ebc = nx.edge_betweenness_centrality(G)
+    # --- 1. 源-荷 Edge Betweenness Centrality (Source-Load aware) ---
+    # 标准BC统计所有节点对的最短路径, 但配电网中重要的是源→荷路径
+    # 使用 edge_betweenness_centrality_subset: 只统计 sources→loads 的最短路径
+    # 这样储能附近的线路BC会降低(因为储能也是源, 缩短了源-荷距离)
+    load_nodes = [bus for bus, load in load_on_bus.items() if load > 0 and bus in G.nodes]
+    source_nodes_in_graph = [s for s in all_sources if s in G.nodes]
+
+    # 源容量权重(kW): 馈线(按系统总负荷量级) + 电池放电功率 + 光伏额定功率
+    total_load = sum(load_on_bus.values())
+    feeder_equiv_kw = max(total_load, 1.0)
+    source_power_kw = {src: feeder_equiv_kw for src in feeder_sources}
+    for bcfg in battery_config.values():
+        bus = bcfg.get('bus')
+        if bus:
+            source_power_kw[bus] = source_power_kw.get(bus, 0.0) + float(bcfg.get('discharge_kw', 0.0))
+    for pcfg in pv_config.values():
+        bus = pcfg.get('bus')
+        if bus:
+            source_power_kw[bus] = source_power_kw.get(bus, 0.0) + float(pcfg.get('power_kw', 0.0))
+    
+    if source_nodes_in_graph and load_nodes:
+        # 源-荷BC: 只考虑从源到荷的最短路径，并按源容量做加权聚合
+        ebc_acc = {e: 0.0 for e in G.edges()}
+        total_source_weight = 0.0
+        for src in source_nodes_in_graph:
+            src_w = max(1e-6, float(source_power_kw.get(src, 1.0)))
+            src_ebc = nx.edge_betweenness_centrality_subset(
+                G, sources=[src], targets=load_nodes
+            )
+            for e, v in src_ebc.items():
+                ebc_acc[e] = ebc_acc.get(e, 0.0) + src_w * v
+            total_source_weight += src_w
+        if total_source_weight > 0:
+            ebc = {e: v / total_source_weight for e, v in ebc_acc.items()}
+        else:
+            ebc = nx.edge_betweenness_centrality_subset(
+                G, sources=source_nodes_in_graph, targets=load_nodes
+            )
+
+        print(f"  源-荷BC: {len(source_nodes_in_graph)}个源节点 → {len(load_nodes)}个负荷节点")
+        print(f"    馈线电源: {feeder_sources}")
+        if battery_sources:
+            print(f"    固定储能(辅助源): {battery_sources}")
+        if pv_sources:
+            print(f"    光伏微网(辅助源): {list(dict.fromkeys(pv_sources))}")
+    else:
+        # 回退: 标准BC
+        ebc = nx.edge_betweenness_centrality(G)
+        print(f"  [回退] 使用标准BC (未找到有效源/荷节点)")
     
     # --- 2. Isolated Load (考虑联络开关+DC/VSC转供) ---
     total_load = sum(load_on_bus.values())
@@ -211,13 +356,14 @@ def  build_network_topology(data_dir: Path = None) -> Dict[str, Dict]:
         if G2.has_edge(u, v):
             G2.remove_edge(u, v)
         
-        # 无转供时的原始孤立负荷
+        # 无转供时的原始孤立负荷 (考虑储能也能供电)
         isolated_load_raw = 0.0
         for node in G.nodes:
             mva = load_on_bus.get(node, 0)
             if mva <= 0:
                 continue
-            connected = any(src in G2 and nx.has_path(G2, node, src) for src in sources)
+            # 先检查是否与任何源(馈线+储能)连通
+            connected = any(src in G2 and nx.has_path(G2, node, src) for src in all_sources)
             if not connected:
                 isolated_load_raw += mva
         
@@ -228,7 +374,7 @@ def  build_network_topology(data_dir: Path = None) -> Dict[str, Dict]:
                 continue
             G2_reconfig.add_edge(ts_u, ts_v)
         
-        # 转供后的残余孤立负荷
+        # 转供后的残余孤立负荷 (考虑储能供电能力)
         isolated_load = 0.0
         for node in G.nodes:
             mva = load_on_bus.get(node, 0)
@@ -237,8 +383,9 @@ def  build_network_topology(data_dir: Path = None) -> Dict[str, Dict]:
             if node not in G2_reconfig:
                 isolated_load += mva
                 continue
+            # 检查与馈线电源或储能的连通性
             connected = any(src in G2_reconfig and nx.has_path(G2_reconfig, node, src)
-                           for src in sources)
+                           for src in all_sources)
             if not connected:
                 isolated_load += mva
         
@@ -267,7 +414,7 @@ def  build_network_topology(data_dir: Path = None) -> Dict[str, Dict]:
             if node not in G2:
                 isolated_load += mva
                 continue
-            connected = any(src in G2 and nx.has_path(G2, node, src) for src in sources)
+            connected = any(src in G2 and nx.has_path(G2, node, src) for src in all_sources)
             if not connected:
                 isolated_load += mva
         iso_load_frac = isolated_load / total_load if total_load > 0 else 0.0
@@ -294,7 +441,7 @@ def  build_network_topology(data_dir: Path = None) -> Dict[str, Dict]:
             if node not in G2:
                 isolated_load += mva
                 continue
-            connected = any(src in G2 and nx.has_path(G2, node, src) for src in sources)
+            connected = any(src in G2 and nx.has_path(G2, node, src) for src in all_sources)
             if not connected:
                 isolated_load += mva
         iso_load_frac = isolated_load / total_load if total_load > 0 else 0.0
@@ -387,7 +534,7 @@ def  build_network_topology(data_dir: Path = None) -> Dict[str, Dict]:
     for bus in load_on_bus:
         if bus not in G_operating:
             G_operating.add_node(bus)
-    for s in sources:
+    for s in all_sources:
         if s not in G_operating:
             G_operating.add_node(s)
     
@@ -424,7 +571,7 @@ def  build_network_topology(data_dir: Path = None) -> Dict[str, Dict]:
             G_temp.remove_edge(u, v)
         
         feeder_reachable = set()
-        for s in sources:
+        for s in all_sources:
             if s in G_temp:
                 feeder_reachable.update(nx.node_connected_component(G_temp, s))
         
@@ -568,7 +715,13 @@ def  build_network_topology(data_dir: Path = None) -> Dict[str, Dict]:
         'dc_edges': dc_edges,             # DC线路 {1-2: (from, to)}
         'vsc_edges': vsc_edges,           # VSC换流器 {1-7: (ac_bus, dc_bus)}
         'load_on_bus': load_on_bus,       # 所有负荷 (AC+DC)
-        'sources': sources,
+        'sources': all_sources,           # 所有源: 馈线电源 + 固定储能母线
+        'feeder_sources': feeder_sources, # 仅馈线电源(无限容量)
+        'battery_sources': battery_sources, # 固定储能母线(有限容量)
+        'battery_config': battery_config, # 固定储能详细配置
+        'pv_sources': pv_sources,         # 光伏微网母线(分布式电源)
+        'pv_config': pv_config,           # 光伏微网详细配置
+        'source_power_kw': source_power_kw, # 源容量权重(kW)
         'total_load': total_load,
         'tie_switches': tie_switches,
         'mess_config': mess_config,
@@ -907,7 +1060,7 @@ def compute_over2h_physical(merged: pd.DataFrame, line_cols: List[str],
 # 数据加载与推理预测
 # ============================================================
 
-def load_data():
+def load_data(case_path_override: Path = None):
     """加载并合并拓扑-调度数据，返回推理所需的全部对象"""
     data_dir = PROJECT_ROOT / "data"
     
@@ -918,22 +1071,23 @@ def load_data():
         "mess_dispatch_report.xlsx",
         "mess_dispatch_results.xlsx",
     ]
-    disp_path = None
+    disp_valid = []
     for name in disp_candidates:
         p = data_dir / name
         if p.exists():
             try:
                 xl = pd.ExcelFile(p)
                 if "HourlyDetails" in xl.sheet_names:
-                    disp_path = p
-                    break
+                    disp_valid.append(p)
             except:
                 pass
+    disp_path = max(disp_valid, key=lambda x: x.stat().st_mtime) if disp_valid else None
     
     if not topo_path.exists():
         raise FileNotFoundError(f"未找到拓扑文件: {topo_path}")
     if disp_path is None:
         raise FileNotFoundError(f"未找到含HourlyDetails的调度文件")
+    print(f"  使用调度文件: {disp_path.name}")
     
     # 加载拓扑
     topo_df = pd.read_excel(topo_path, sheet_name="RollingDecisionsOriginal")
@@ -976,21 +1130,31 @@ def load_data():
     
     # 读取Julia基线
     baseline = {}
-    for km_name in ["mess_dispatch_results_key_metrics.json", "mess_dispatch_report_key_metrics.json"]:
+    km_candidates = []
+    paired_km = disp_path.with_name(disp_path.stem + "_key_metrics.json")
+    if paired_km.exists():
+        km_candidates.append(paired_km)
+    for km_name in ["mess_dispatch_report_key_metrics.json", "mess_dispatch_results_key_metrics.json"]:
         km_path = data_dir / km_name
-        if km_path.exists():
-            with open(km_path, 'r', encoding='utf-8') as f:
-                km_data = json.load(f)
-            baseline = {
-                'expected_load_shed_total': km_data.get('expected_load_shed_total', 0),
-                'expected_supply_ratio': km_data.get('expected_supply_ratio', 0),
-                'violations': km_data.get('violations', []),
-            }
-            break
+        if km_path.exists() and km_path not in km_candidates:
+            km_candidates.append(km_path)
+    if km_candidates:
+        if paired_km.exists():
+            selected_km = paired_km
+        else:
+            selected_km = max(km_candidates, key=lambda x: x.stat().st_mtime)
+        with open(selected_km, 'r', encoding='utf-8') as f:
+            km_data = json.load(f)
+        baseline = {
+            'expected_load_shed_total': km_data.get('expected_load_shed_total', 0),
+            'expected_supply_ratio': km_data.get('expected_supply_ratio', 0),
+            'violations': km_data.get('violations', []),
+        }
+        print(f"  使用基线指标文件: {selected_km.name}")
     
     # 计算拓扑特征
     print("  构建网络拓扑,计算结构特征...")
-    topo_features = build_network_topology(data_dir)
+    topo_features = build_network_topology(data_dir, case_path=case_path_override)
     if topo_features:
         n_lines = sum(1 for k in topo_features if k != '_network')
         n_crit = sum(1 for k, v in topo_features.items() if k != '_network' and v.get('is_critical'))
@@ -1989,12 +2153,17 @@ def run_julia_verification(target_lines: List[str], data_dir: Path) -> Dict:
         "mess_dispatch_report.xlsx",
         "mess_dispatch_results.xlsx",
     ]
-    disp_path = None
+    disp_valid = []
     for name in disp_candidates:
         p = data_dir / name
         if p.exists():
-            disp_path = p
-            break
+            try:
+                xl = pd.ExcelFile(p)
+                if "HourlyDetails" in xl.sheet_names:
+                    disp_valid.append(p)
+            except:
+                pass
+    disp_path = max(disp_valid, key=lambda x: x.stat().st_mtime) if disp_valid else None
     
     if not mc_path.exists():
         return {'status': 'failed', 'error': f'未找到MC数据文件: {mc_path}'}

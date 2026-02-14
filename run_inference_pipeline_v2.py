@@ -1181,14 +1181,24 @@ def _verify_counterfactual_with_julia(
     # Step 1: 提取原始弹性指标
     print(f"      [Step 1] 读取原始弹性指标...")
     
-    # 查找正确的原始key_metrics文件
-    candidate_files = [
+    # 查找正确的原始key_metrics文件（优先与原始调度文件同名配套，其次取 data 下最新）
+    candidate_files = []
+    dispatch_path = Path(original_dispatch_path) if original_dispatch_path else None
+    if dispatch_path:
+        paired = dispatch_path.with_name(dispatch_path.stem + "_key_metrics.json")
+        if paired.exists():
+            candidate_files.append(paired)
+
+    data_candidates = [
         project_root / "data" / "mess_dispatch_results_key_metrics.json",
         project_root / "data" / "mess_dispatch_report_key_metrics.json",
-        Path(original_dispatch_path).with_name(
-            Path(original_dispatch_path).stem + "_key_metrics.json"
-        )
     ]
+    data_candidates = [p for p in data_candidates if p.exists()]
+    data_candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+
+    for p in data_candidates:
+        if p not in candidate_files:
+            candidate_files.append(p)
     
     original_metrics = None
     for candidate in candidate_files:

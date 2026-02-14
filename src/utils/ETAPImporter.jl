@@ -2343,9 +2343,41 @@ function load_storages!(case::JuliaPowerCase, file_path::String, sheet_name::Str
                 type = haskey(row, :type) ? safe_get_value(row[:type], "", String) : ""
                 controllable = haskey(row, :controllable) ? parse_bool(safe_get_value(row[:controllable], true)) : true
                 
-                # 默认容量（Excel中没有提供）
-                energy_capacity = 100000.0
-                power_capacity_mw = max(energy_capacity / 1000.0, 0.1)
+                # ── 从Excel电气参数计算储能容量和功率 ──
+                # 读取关键参数
+                vbat_max = haskey(row, :vbatmax) ? safe_get_value(row[:vbatmax], 0.0, Float64) : 0.0
+                vbat_min = haskey(row, :vbatmin) ? safe_get_value(row[:vbatmin], 0.0, Float64) : 0.0
+                i_discharge_max = haskey(row, :idischargemax) ? safe_get_value(row[:idischargemax], 0.0, Float64) : 0.0
+                i_charge_max = haskey(row, :ichargemax) ? safe_get_value(row[:ichargemax], 0.0, Float64) : 0.0
+                eff_pct = haskey(row, :eff) ? safe_get_value(row[:eff], 90.0, Float64) : 90.0
+                rated_kva = haskey(row, :rated) ? safe_get_value(row[:rated], 0.0, Float64) : 0.0
+                soc_pct = haskey(row, :operatingsoc) ? safe_get_value(row[:operatingsoc], 50.0, Float64) : 50.0
+                
+                # 放电功率 (kW): VbatMax × IdischargeMax × NrOfStrings / 1000
+                # NrOfStrings 代表并联支路数, 增加放电电流能力
+                power_kw = vbat_max * i_discharge_max * str / 1000.0
+                if power_kw <= 0.0 && rated_kva > 0.0
+                    power_kw = rated_kva  # 回退到额定容量 (kVA ≈ kW)
+                end
+                power_kw = max(power_kw, 1.0)  # 最小1kW
+                
+                # 容量 (kWh): 假设4小时持续时间 (配电级储能典型值)
+                energy_capacity = power_kw * 4.0
+                # 放大静止储能容量 (kWh)
+                energy_capacity *= 50.0
+                
+                # 功率 (MW)
+                power_capacity_mw = power_kw*50 / 1000.0
+                
+                # 效率: 从百分比转换
+                efficiency = eff_pct > 1.0 ? eff_pct / 100.0 : eff_pct
+                efficiency = clamp(efficiency, 0.1, 1.0)
+                
+                # 初始SOC: 从百分比转换
+                soc_init_frac = soc_pct > 1.0 ? soc_pct / 100.0 : soc_pct
+                soc_init_frac = clamp(soc_init_frac, 0.1, 0.9)
+                
+                @info "储能 $name: 功率=$(round(power_kw, digits=1))kW, 容量=$(round(energy_capacity, digits=1))kWh, 效率=$(round(efficiency*100, digits=1))%, 母线=$bus_name(node=$node_id)"
 
                 # 创建Storageetap对象并添加到case中
                 push!(case.storageetap, Storageetap(
@@ -2354,10 +2386,10 @@ function load_storages!(case::JuliaPowerCase, file_path::String, sheet_name::Str
                     bus_id=node_id,
                     energy_capacity_kwh=energy_capacity,
                     power_capacity_mw=power_capacity_mw,
-                    soc_init=0.5,
+                    soc_init=soc_init_frac,
                     soc_min=0.1,
                     soc_max=0.9,
-                    efficiency=0.9,
+                    efficiency=efficiency,
                     voc_kv=voc,
                     status=in_service ? 1 : 0
                 ))

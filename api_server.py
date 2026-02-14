@@ -19,6 +19,7 @@ from urllib.parse import urlsplit
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 import threading
+import numpy as np
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 _VENV_PYTHON = PROJECT_ROOT / ".venv" / "Scripts" / "python.exe"
@@ -85,6 +86,8 @@ from flask import Flask, jsonify, request
 
 import app as typhoon_cli
 import requests
+from validate_inference import load_data
+from run_ml_inference import extract_features_for_all_lines, infer_loss_improvement_ml
 TEMP_UPLOAD_DIR = PROJECT_ROOT / "temp" / "api_uploads"
 TEMP_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 # 确保 Julia 使用项目内的环境
@@ -215,6 +218,18 @@ def _extract_payload() -> Dict[str, Any]:
     if not isinstance(payload, dict):
         raise ValueError("请求体必须是 JSON 对象")
     return payload
+
+
+def _save_uploaded_file(upload_field: str) -> Optional[Path]:
+    file_obj = request.files.get(upload_field)
+    if file_obj is None or not file_obj.filename:
+        return None
+    suffix = _infer_suffix(file_obj.filename)
+    safe_suffix = suffix if re.fullmatch(r"\.[A-Za-z0-9]{1,8}", suffix) else ".dat"
+    temp_name = f"upload_{uuid.uuid4().hex}{safe_suffix}"
+    target = TEMP_UPLOAD_DIR / temp_name
+    file_obj.save(target)
+    return target
 
 
 def _call_workflow_direct(julia_code: str) -> None:
@@ -1346,6 +1361,110 @@ def api_inference_quick_stats():
             "message": f"统计分析失败: {str(exc)}",
             "error_detail": traceback.format_exc(),
         }), 500
+
+
+@app.route("/api/ml-inference/ranking", methods=["POST"])
+def api_ml_inference_ranking():
+    """
+    机器学习推理层API（无监督、失负荷单目标）
+
+    说明:
+      - 仅替换配网规划文件 `ac_dc_real_case.xlsx`
+      - 其余输入文件沿用 data/ 默认文件
+      - 返回加固线路排序和预测失负荷削减比例
+      - 不做真实值对比
+
+    输入（JSON或multipart/form-data）:
+      - acdc_real_case_file: 本地路径或URL（JSON）
+      - acdc_real_case_upload: 直接上传文件（multipart）
+      - top_n: 返回前N条（默认35）
+    """
+    uploaded_temp: Optional[Path] = None
+    try:
+        payload = _extract_payload() if request.is_json else {}
+        top_n = int((payload.get("top_n") if payload else request.form.get("top_n", 35)) or 35)
+        top_n = max(1, min(35, top_n))
+
+        # 优先multipart上传，其次JSON路径/URL
+        uploaded_temp = _save_uploaded_file("acdc_real_case_upload")
+        case_path_str = None
+        if uploaded_temp is not None:
+            case_path = uploaded_temp.resolve()
+        else:
+            case_path_str = (payload.get("acdc_real_case_file") if payload else request.form.get("acdc_real_case_file"))
+            if not case_path_str:
+                return jsonify({
+                    "status": "error",
+                    "message": "缺少配网规划文件参数，请提供 acdc_real_case_file 或 acdc_real_case_upload",
+                }), 400
+            resolved = _normalize_path(case_path_str)
+            if not resolved:
+                return jsonify({
+                    "status": "error",
+                    "message": "acdc_real_case_file 解析失败",
+                }), 400
+            case_path = Path(resolved)
+
+        if not case_path.exists():
+            return jsonify({
+                "status": "error",
+                "message": f"配网规划文件不存在: {case_path}",
+            }), 400
+
+        if case_path.suffix.lower() not in {".xlsx", ".xls"}:
+            return jsonify({
+                "status": "error",
+                "message": "配网规划文件必须为 Excel（.xlsx/.xls）",
+            }), 400
+
+        merged, line_cols, baseline, data_dir, disp_path, topo_features = load_data(case_path_override=case_path)
+        features_df = extract_features_for_all_lines(
+            merged,
+            line_cols,
+            baseline,
+            topo_features,
+            gt_df=None,
+            original_preds={},
+        )
+        pred, confidence, infer_meta = infer_loss_improvement_ml(features_df, baseline, return_meta=True)
+
+        line_names = features_df.index.tolist()
+        order = np.argsort(-pred)
+        ranking = []
+        for rank_i, idx in enumerate(order[:top_n], 1):
+            ranking.append({
+                "rank": rank_i,
+                "line_name": line_names[idx],
+                "predicted_loss_reduction_ratio": float(pred[idx]),
+                "predicted_loss_reduction_percent": float(pred[idx] * 100.0),
+                "confidence": float(confidence[idx]),
+            })
+
+        return jsonify({
+            "status": "success",
+            "mode": "loss_only_no_supervised_training",
+            "input": {
+                "acdc_real_case_file": str(case_path),
+                "dispatch_file": str(disp_path),
+                "top_n": top_n,
+            },
+            "inference_meta": infer_meta,
+            "ranking": ranking,
+        })
+
+    except Exception as exc:
+        import traceback
+        return jsonify({
+            "status": "error",
+            "message": f"ML推理失败: {str(exc)}",
+            "error_detail": traceback.format_exc(),
+        }), 500
+    finally:
+        if uploaded_temp is not None:
+            try:
+                uploaded_temp.unlink(missing_ok=True)
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":
