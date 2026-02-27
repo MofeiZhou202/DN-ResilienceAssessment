@@ -1295,10 +1295,28 @@ def evaluate_loss_only(y_true: np.ndarray, y_pred: np.ndarray, label: str = "") 
     return result
 
 
-def generate_loss_only_report(line_names, y_true, pred_ml, output_dir, eval_ml, confidence_scores=None, infer_meta=None):
+def build_line_display_name_map(topo_features: Dict) -> Dict[str, str]:
+    """构建线路ID到真实名称(起止母线)的映射，便于与API输出对齐。"""
+    network = topo_features.get('_network', {}) if isinstance(topo_features, dict) else {}
+    all_line_info = network.get('all_line_info', {}) if isinstance(network, dict) else {}
+    mapping: Dict[str, str] = {}
+    for info in all_line_info.values():
+        if not isinstance(info, dict):
+            continue
+        line_id = str(info.get('line_id', '')).strip()
+        from_bus = str(info.get('from', '')).strip()
+        to_bus = str(info.get('to', '')).strip()
+        if not line_id or not from_bus or not to_bus:
+            continue
+        mapping[line_id] = f"{from_bus} - {to_bus}"
+    return mapping
+
+
+def generate_loss_only_report(line_names, y_true, pred_ml, output_dir, eval_ml, confidence_scores=None, infer_meta=None, line_display_map=None):
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
     true_rank = np.argsort(np.argsort(-y_true)) + 1
     ml_rank = np.argsort(np.argsort(-pred_ml)) + 1
+    line_display_map = line_display_map or {}
 
     md = []
     md.append("# 配电网线路加固优先级 —— 失负荷单目标 ML 对比报告")
@@ -1311,15 +1329,16 @@ def generate_loss_only_report(line_names, y_true, pred_ml, output_dir, eval_ml, 
     for metric in ['spearman', 'kendall', 'top5_overlap', 'top10_overlap', 'mae', 'rmse']:
         md.append(f"| {metric} | {eval_ml.get(metric, 0):.4f} |")
 
-    md.append("\n## 逐线路对比（按真实改善排序）\n")
-    md.append("| 线路 | 真实排名 | ML排名 | 真实失负荷改善 | ML预测失负荷改善 | 绝对误差 | 置信度 |")
-    md.append("|------|:------:|:-----:|:--------------:|:---------------:|:-------:|:-----:|")
+    md.append("## 逐线路对比（按真实改善排序）\n")
+    md.append("| 线路ID | 线路名称 | 真实排名 | ML排名 | 真实失负荷改善 | ML预测失负荷改善 | 绝对误差 | 置信度 |")
+    md.append("|--------|----------|:------:|:-----:|:--------------:|:---------------:|:-------:|:-----:|")
     for idx in np.argsort(-y_true):
         ln = line_names[idx]
+        display_name = line_display_map.get(ln, ln.replace('_', ' '))
         err = abs(y_true[idx] - pred_ml[idx])
         conf = float(confidence_scores[idx]) if confidence_scores is not None else 0.0
         md.append(
-            f"| {ln} | {true_rank[idx]} | {ml_rank[idx]} | {y_true[idx]*100:.3f}% | {pred_ml[idx]*100:.3f}% | {err*100:.3f}% | {conf:.3f} |"
+            f"| {ln} | {display_name} | {true_rank[idx]} | {ml_rank[idx]} | {y_true[idx]*100:.3f}% | {pred_ml[idx]*100:.3f}% | {err*100:.3f}% | {conf:.3f} |"
         )
 
     report_text = "\n".join(md)
@@ -1332,6 +1351,7 @@ def generate_loss_only_report(line_names, y_true, pred_ml, output_dir, eval_ml, 
         'inference_meta': infer_meta or {},
         'per_line': [{
             'line_name': line_names[idx],
+            'line_display_name': line_display_map.get(line_names[idx], line_names[idx].replace('_', ' ')),
             'actual_loss_improvement': float(y_true[idx]),
             'ml_predicted_loss_improvement': float(pred_ml[idx]),
             'actual_rank': int(true_rank[idx]),
@@ -1517,6 +1537,7 @@ def main():
     # Step 3: 无监督ML推理（失负荷）
     print("\n[3] ML推理（仅失负荷改善率，不做监督训练）...")
     line_names = features_df.index.tolist()
+    line_display_map = build_line_display_name_map(topo_features)
     pred_ml, confidence_all, infer_meta = infer_loss_improvement_ml(features_df, baseline, return_meta=True)
     n_nonzero = int(np.sum(pred_ml > 0))
     print(f"  完成: {len(line_names)} 条线路, {n_nonzero} 条预测为非零改善")
@@ -1564,7 +1585,16 @@ def main():
     print("\n[5] 生成ML与真实对比报告...")
     output_dir = PROJECT_ROOT / "output"
     output_dir.mkdir(exist_ok=True)
-    generate_loss_only_report(common_lines, y_true, pred_eval, output_dir, eval_ml, confidence_scores=conf_eval, infer_meta=infer_meta)
+    generate_loss_only_report(
+        common_lines,
+        y_true,
+        pred_eval,
+        output_dir,
+        eval_ml,
+        confidence_scores=conf_eval,
+        infer_meta=infer_meta,
+        line_display_map=line_display_map,
+    )
 
     true_rank = np.argsort(np.argsort(-y_true)) + 1
     ml_rank = np.argsort(np.argsort(-pred_eval)) + 1
@@ -1574,6 +1604,18 @@ def main():
         ln = common_lines[idx]
         err = abs(y_true[idx] - pred_eval[idx])
         print(f"  {true_rank[idx]:>4} {ml_rank[idx]:>4}  {ln:<14} {y_true[idx]*100:>9.3f}% {pred_eval[idx]*100:>9.3f}% {err*100:>9.3f}%")
+
+    print("\n  API对齐视图（按ML预测降序，Top-10）")
+    print(f"  {'ML排':>4} {'线路ID':<14} {'线路名称':<42} {'ML预测':>10} {'置信度':>8}")
+    print(f"  {'─'*94}")
+    order_ml = np.argsort(-pred_eval)
+    for idx in order_ml[:10]:
+        ln = common_lines[idx]
+        display_name = line_display_map.get(ln, ln.replace('_', ' '))
+        print(
+            f"  {ml_rank[idx]:>4} {ln:<14} {display_name:<42.42} "
+            f"{pred_eval[idx]*100:>9.3f}% {conf_eval[idx]:>8.3f}"
+        )
     
     elapsed = time.time() - t_start
     print(f"\n{'='*60}")

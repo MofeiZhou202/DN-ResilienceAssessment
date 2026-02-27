@@ -377,6 +377,74 @@ def _call_workflow(func_name: str, arguments: Dict[str, Any]) -> Any:
             raise
 
 
+def _build_line_display_name_map(topo_features: Dict[str, Any]) -> Dict[str, str]:
+    """根据拓扑信息构建线路ID到真实名称(起止母线)的映射。"""
+    network = topo_features.get("_network", {}) if isinstance(topo_features, dict) else {}
+    all_line_info = network.get("all_line_info", {}) if isinstance(network, dict) else {}
+    mapping: Dict[str, str] = {}
+    for info in all_line_info.values():
+        if not isinstance(info, dict):
+            continue
+        line_id = str(info.get("line_id", "")).strip()
+        from_bus = str(info.get("from", "")).strip()
+        to_bus = str(info.get("to", "")).strip()
+        if not line_id or not from_bus or not to_bus:
+            continue
+        mapping[line_id] = f"{from_bus} - {to_bus}"
+    return mapping
+
+
+def _copy_to_data_if_needed(src: Path, dst: Path) -> None:
+    """将文件复制到 data 目录目标路径；若源目标相同则跳过。"""
+    src_resolved = src.resolve()
+    dst_resolved = dst.resolve()
+    if src_resolved == dst_resolved:
+        return
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(src_resolved, dst_resolved)
+
+
+def _sync_dn_resilience_outputs_to_data(
+    *,
+    tower_seg_path: Path,
+    case_path: Path,
+    cluster_output: Path,
+    phase_output: Path,
+    topology_output: Path,
+    dispatch_output: Path,
+) -> Dict[str, str]:
+    """将 DN-RESILIENCE 本次结果同步到 data/ 固定文件名，供后续推理层直接读取。"""
+    data_dir = PROJECT_ROOT / "data"
+    data_dir.mkdir(parents=True, exist_ok=True)
+
+    sync_targets = {
+        case_path: data_dir / "ac_dc_real_case.xlsx",
+        tower_seg_path: data_dir / "TowerSeg.xlsx",
+        cluster_output: data_dir / "mc_simulation_results_k100_clusters.xlsx",
+        phase_output: data_dir / "scenario_phase_classification.xlsx",
+        topology_output: data_dir / "topology_reconfiguration_results.xlsx",
+        dispatch_output: data_dir / "mess_dispatch_results.xlsx",
+    }
+
+    synced: Dict[str, str] = {}
+    for src, dst in sync_targets.items():
+        if src.exists():
+            _copy_to_data_if_needed(src, dst)
+            synced[dst.name] = str(dst)
+
+    # 统一同步关键指标，兼容不同读取逻辑
+    src_km = dispatch_output.with_name(dispatch_output.stem + "_key_metrics.json")
+    if src_km.exists():
+        dst_km_results = data_dir / "mess_dispatch_results_key_metrics.json"
+        dst_km_report = data_dir / "mess_dispatch_report_key_metrics.json"
+        _copy_to_data_if_needed(src_km, dst_km_results)
+        _copy_to_data_if_needed(src_km, dst_km_report)
+        synced[dst_km_results.name] = str(dst_km_results)
+        synced[dst_km_report.name] = str(dst_km_report)
+
+    return synced
+
+
 def _success(message: str, **data: Any):
     return jsonify({"status": "success", "message": message, **data})
 
@@ -794,6 +862,16 @@ run_mess_dispatch_julia(
     
     if not dispatch_output.exists():
         raise RuntimeError("MESS调度完成，但移动储能求解结果文件未生成")
+
+    # 关键：每次执行后同步到 data/ 固定文件名，确保推理层直接使用最新文件
+    synced_data_files = _sync_dn_resilience_outputs_to_data(
+        tower_seg_path=tower_seg_path,
+        case_path=case_path,
+        cluster_output=cluster_output,
+        phase_output=phase_output,
+        topology_output=topology_output,
+        dispatch_output=dispatch_output,
+    )
     
     return {
         "status": "success",
@@ -808,6 +886,7 @@ run_mess_dispatch_julia(
             "topology_output": str(topology_output),
             "dispatch_output": str(dispatch_output),
         },
+        "synced_data_files": synced_data_files,
         "execution_time": {
             "step1_typhoon_generation": f"{step1_time:.2f}s",
             "step2_phase_classification": f"{step2_time:.2f}s",
@@ -1429,12 +1508,14 @@ def api_ml_inference_ranking():
         pred, confidence, infer_meta = infer_loss_improvement_ml(features_df, baseline, return_meta=True)
 
         line_names = features_df.index.tolist()
+        line_display_map = _build_line_display_name_map(topo_features)
         order = np.argsort(-pred)
         ranking = []
         for rank_i, idx in enumerate(order[:top_n], 1):
+            line_id = line_names[idx]
             ranking.append({
                 "rank": rank_i,
-                "line_name": line_names[idx],
+                "line_name": line_display_map.get(line_id, line_id.replace("_", " ")),
                 "predicted_loss_reduction_ratio": float(pred[idx]),
                 "predicted_loss_reduction_percent": float(pred[idx] * 100.0),
                 "confidence": float(confidence[idx]),
